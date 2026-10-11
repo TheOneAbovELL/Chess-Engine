@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, Index, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base, UTCDateTime, utcnow
@@ -11,7 +11,8 @@ from app.db.base import Base, UTCDateTime, utcnow
 class Game(Base):
     """One stored game.
 
-    ``(source, external_id)`` is the deduplication key:
+    ``(user_id, source, external_id)`` is the deduplication key (each account
+    has its own library; two users may store the same public game):
 
     * ``chesscom``: ``live/<id>`` or ``daily/<id>`` from the game URL
     * ``lichess``: the 8-character game id
@@ -25,12 +26,13 @@ class Game(Base):
 
     __tablename__ = "games"
     __table_args__ = (
-        UniqueConstraint("source", "external_id"),
-        Index("ix_games_owner_played", "owner_username", "played_at"),
-        Index("ix_games_source_owner", "source", "owner_username"),
+        UniqueConstraint("user_id", "source", "external_id"),
+        Index("ix_games_user_played", "user_id", "played_at"),
+        Index("ix_games_user_owner", "user_id", "source", "owner_username"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
     source: Mapped[str] = mapped_column(String(16), index=True)
     external_id: Mapped[str] = mapped_column(String(128))
     owner_username: Mapped[str | None] = mapped_column(String(64))  # lower-cased account name
@@ -59,5 +61,6 @@ class Game(Base):
     moves_uci: Mapped[str] = mapped_column(Text, default="")
     pgn: Mapped[str] = mapped_column(Text)
 
+    opening_version: Mapped[int | None] = mapped_column(Integer)  # opening book version used to name it
     import_job_id: Mapped[str | None] = mapped_column(String(36))
     imported_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)

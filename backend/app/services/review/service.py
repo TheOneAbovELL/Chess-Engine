@@ -14,17 +14,24 @@ from __future__ import annotations
 import asyncio
 import itertools
 import logging
+from datetime import timedelta
 from typing import Any
 
 import chess
 import chess.pgn
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 
 from app.core.config import Settings
-from app.core.errors import ConflictError, EngineUnavailableError, InvalidInputError, NotFoundError
+from app.core.errors import (
+    ConflictError,
+    EngineUnavailableError,
+    InvalidInputError,
+    NotFoundError,
+    RateLimitedError,
+)
 from app.db.base import utcnow
 from app.db.session import Database
-from app.jobs.worker import BackgroundWorker
+from app.jobs.worker import BackgroundWorker, claim, requeue_stale, touch
 from app.models import Game, GameReview, PositionEvaluation
 from app.models.jobs import ACTIVE_STATUSES, CANCELLED, COMPLETED, FAILED, QUEUED, RUNNING
 from app.services.chess.pgn import parse_single_game
@@ -84,19 +91,47 @@ def position_to_dict(p: PositionEvaluation) -> dict[str, Any]:
 
 
 class GameReviewService(BackgroundWorker[int]):
+    """Review jobs. Each review worker owns one engine process; run several
+    (``review_workers``) to review games in parallel on a bigger machine."""
+
     name = "review-worker"
+    kind = "reviews"
     poll_interval_s = 3.0
 
-    def __init__(self, db: Database, settings: Settings, manager: EngineManager, store: SettingsStore) -> None:
-        super().__init__()
-        self.db = db
+    def __init__(
+        self, db: Database, settings: Settings, manager: EngineManager, store: SettingsStore, index: int = 0
+    ) -> None:
+        super().__init__(db, settings.job_stale_after_s, index)
         self.settings = settings
         self.manager = manager
         self.store = store
 
+    def _check_quotas(self, session: Any, user_id: int, new: int = 1) -> None:
+        queued = session.execute(
+            select(func.count(GameReview.id)).where(
+                GameReview.user_id == user_id, GameReview.status.in_(ACTIVE_STATUSES)
+            )
+        ).scalar_one()
+        if queued + new > self.settings.max_queued_reviews_per_user:
+            raise ConflictError(
+                f"You can have at most {self.settings.max_queued_reviews_per_user} reviews waiting.",
+                code="review_queue_full",
+            )
+        if self.settings.max_reviews_per_day is not None:
+            since = utcnow() - timedelta(days=1)
+            today = session.execute(
+                select(func.count(GameReview.id)).where(GameReview.user_id == user_id, GameReview.created_at >= since)
+            ).scalar_one()
+            if today + new > self.settings.max_reviews_per_day:
+                raise RateLimitedError(
+                    f"Daily review limit reached ({self.settings.max_reviews_per_day} per 24 hours). Try again later.",
+                    code="review_quota",
+                )
+
     # -------------------------------------------------------------- enqueue
     def enqueue(
         self,
+        user_id: int,
         game_id: int,
         *,
         engine_id: str | None = None,
@@ -116,7 +151,7 @@ class GameReviewService(BackgroundWorker[int]):
             raise InvalidInputError(f"Depth must be at most {self.settings.max_search_depth}.")
         with self.db.session() as session:
             game = session.get(Game, game_id)
-            if game is None:
+            if game is None or game.user_id != user_id:
                 raise NotFoundError("Game not found.")
             if game.ply_count > MAX_REVIEW_PLIES:
                 raise InvalidInputError("This game is too long to review.", code="game_too_long")
@@ -129,12 +164,14 @@ class GameReviewService(BackgroundWorker[int]):
                 same = existing.engine_id == engine_id and existing.settings.get("depth") == depth
                 if same:
                     return review_to_dict(existing)
+            self._check_quotas(session, user_id)
             review = GameReview(
                 game_id=game_id,
+                user_id=user_id,
                 status=QUEUED,
                 engine_id=engine_id,
                 settings={"depth": depth, "movetime_ms": movetime_ms, "multipv": multipv},
-                thresholds=self.store.thresholds().model_dump(),
+                thresholds=self.store.thresholds(user_id).model_dump(),
                 progress_total=game.ply_count + 1,
             )
             session.add(review)
@@ -143,58 +180,61 @@ class GameReviewService(BackgroundWorker[int]):
         self.notify()
         return result
 
-    def enqueue_many(self, game_ids: list[int], **kwargs: Any) -> list[dict[str, Any]]:
+    def enqueue_many(self, user_id: int, game_ids: list[int], **kwargs: Any) -> list[dict[str, Any]]:
         if len(game_ids) > self.settings.max_batch_review_games:
             raise InvalidInputError(f"At most {self.settings.max_batch_review_games} games per batch.")
         results = []
         for game_id in game_ids:
             try:
-                results.append(self.enqueue(game_id, **kwargs))
-            except (NotFoundError, InvalidInputError) as exc:
+                results.append(self.enqueue(user_id, game_id, **kwargs))
+            except (NotFoundError, InvalidInputError, ConflictError, RateLimitedError) as exc:
                 results.append({"game_id": game_id, "error": exc.message})
         return results
 
     # --------------------------------------------------------------- queries
-    def get(self, review_id: int, *, with_positions: bool = False) -> dict[str, Any]:
-        with self.db.session() as session:
-            review = session.get(GameReview, review_id)
-            if review is None:
-                raise NotFoundError("Review not found.")
-            return review_to_dict(review, with_positions=with_positions)
+    @staticmethod
+    def _owned(session: Any, user_id: int, review_id: int) -> GameReview:
+        review = session.get(GameReview, review_id)
+        if review is None or review.user_id != user_id:
+            raise NotFoundError("Review not found.")
+        return review  # type: ignore[no-any-return]
 
-    def latest_for_game(self, game_id: int) -> dict[str, Any] | None:
+    def get(self, user_id: int, review_id: int, *, with_positions: bool = False) -> dict[str, Any]:
+        with self.db.session() as session:
+            return review_to_dict(self._owned(session, user_id, review_id), with_positions=with_positions)
+
+    def latest_for_game(self, user_id: int, game_id: int) -> dict[str, Any] | None:
         with self.db.session() as session:
             review = session.execute(
-                select(GameReview).where(GameReview.game_id == game_id).order_by(GameReview.id.desc()).limit(1)
+                select(GameReview)
+                .where(GameReview.game_id == game_id, GameReview.user_id == user_id)
+                .order_by(GameReview.id.desc())
+                .limit(1)
             ).scalar_one_or_none()
             return review_to_dict(review, with_positions=True) if review else None
 
-    def queue(self) -> list[dict[str, Any]]:
+    def queue(self, user_id: int) -> list[dict[str, Any]]:
         with self.db.session() as session:
             rows = session.execute(
                 select(GameReview, Game.white, Game.black)
                 .join(Game, Game.id == GameReview.game_id)
-                .where(GameReview.status.in_(ACTIVE_STATUSES))
+                .where(GameReview.status.in_(ACTIVE_STATUSES), GameReview.user_id == user_id)
                 .order_by(GameReview.id.asc())
             ).all()
             return [{**review_to_dict(r), "white": w, "black": b} for r, w, b in rows]
 
-    def cancel(self, review_id: int) -> dict[str, Any]:
+    def cancel(self, user_id: int, review_id: int) -> dict[str, Any]:
         with self.db.session() as session:
-            review = session.get(GameReview, review_id)
-            if review is None:
-                raise NotFoundError("Review not found.")
+            review = self._owned(session, user_id, review_id)
             if review.status == QUEUED:
                 review.status, review.finished_at = CANCELLED, utcnow()
             elif review.status == RUNNING:
                 review.cancel_requested = True
             return review_to_dict(review)
 
-    def retry(self, review_id: int) -> dict[str, Any]:
+    def retry(self, user_id: int, review_id: int) -> dict[str, Any]:
         with self.db.session() as session:
-            review = session.get(GameReview, review_id)
-            if review is None:
-                raise NotFoundError("Review not found.")
+            review = self._owned(session, user_id, review_id)
             if review.status in ACTIVE_STATUSES:
                 raise ConflictError("This review is still in progress.")
             if review.status == COMPLETED:
@@ -204,13 +244,11 @@ class GameReviewService(BackgroundWorker[int]):
         self.notify()
         return result
 
-    def reclassify(self, review_id: int) -> dict[str, Any]:
+    def reclassify(self, user_id: int, review_id: int) -> dict[str, Any]:
         """Re-label moves with the current thresholds (no engine work)."""
-        thresholds = self.store.thresholds()
+        thresholds = self.store.thresholds(user_id)
         with self.db.session() as session:
-            review = session.get(GameReview, review_id)
-            if review is None:
-                raise NotFoundError("Review not found.")
+            review = self._owned(session, user_id, review_id)
             if review.status != COMPLETED:
                 raise ConflictError("Only completed reviews can be reclassified.")
             review.thresholds = thresholds.model_dump()
@@ -218,23 +256,15 @@ class GameReviewService(BackgroundWorker[int]):
             return review_to_dict(review, with_positions=True)
 
     # --------------------------------------------------------------- worker
-    def recover(self) -> None:
-        with self.db.session() as session:
-            session.execute(
-                update(GameReview).where(GameReview.status == RUNNING).values(status=QUEUED, cancel_requested=False)
-            )
+    def requeue(self) -> None:
+        requeue_stale(self.db, GameReview, self.stale_after_s)
 
     def claim_next(self) -> int | None:
-        with self.db.session() as session:
-            review = session.execute(
-                select(GameReview).where(GameReview.status == QUEUED).order_by(GameReview.id.asc()).limit(1)
-            ).scalar_one_or_none()
-            if review is None:
-                return None
-            review.status = RUNNING
-            review.started_at = review.started_at or utcnow()
-            review.attempts += 1
-            return review.id
+        job = claim(self.db, GameReview, GameReview.id, self.worker_id)
+        return int(job) if job is not None else None
+
+    def touch_job(self, job: int) -> None:
+        touch(self.db, GameReview, job, self.worker_id)
 
     def mark_crashed(self, job: int) -> None:
         with self.db.session() as session:
@@ -286,7 +316,7 @@ class GameReviewService(BackgroundWorker[int]):
         limits = SearchLimits(depth=int(settings["depth"]), movetime_ms=int(settings["movetime_ms"]))
         multipv = int(settings.get("multipv", 1))
         try:
-            slot = self.manager.slot(review.engine_id, "review")
+            slot = self.manager.slot(review.engine_id, "review", self.index)
         except EngineUnavailableError as exc:
             await asyncio.to_thread(self._fail, job, exc.message)
             return
@@ -403,15 +433,17 @@ class GameReviewService(BackgroundWorker[int]):
         review.summary = summarize(verdicts)
 
     def _complete(self, review_id: int) -> None:
-        thresholds = self.store.thresholds()
         with self.db.session() as session:
             review = session.get(GameReview, review_id)
             if review is None:
                 return
+            thresholds = self.store.thresholds(review.user_id)
             review.thresholds = thresholds.model_dump()
             self._classify(session, review, thresholds)
             review.status, review.finished_at, review.error = COMPLETED, utcnow(), None
-            review.engine_name = self.manager.slot(review.engine_id, "review").engine.identity[0] or review.engine_id
+            review.engine_name = (
+                self.manager.slot(review.engine_id, "review", self.index).engine.identity[0] or review.engine_id
+            )
             review.progress_done = len(review.positions)
 
     def _set_status(self, review_id: int, status: str) -> None:

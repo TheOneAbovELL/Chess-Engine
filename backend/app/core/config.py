@@ -28,7 +28,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 BACKEND_ROOT = PROJECT_ROOT / "backend"
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.2.0"
 
 
 def default_data_dir() -> Path:
@@ -62,6 +62,16 @@ class Settings(BaseSettings):
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     log_json: bool = False
 
+    # ---- Accounts --------------------------------------------------------------
+    # "none": single-user local mode (no login; everything belongs to one user).
+    # "password": accounts with username + password (required for any shared or
+    # internet-facing deployment).
+    auth_mode: Literal["none", "password"] = "none"
+    allow_registration: bool = True
+    session_days: int = Field(30, ge=1, le=365)
+    secure_cookies: bool | None = None  # default: True in production
+    expose_api_docs: bool | None = None  # default: False in production
+
     data_dir: Path = Field(default_factory=default_data_dir)
     database_url: str | None = None  # default: sqlite file inside data_dir
 
@@ -89,6 +99,29 @@ class Settings(BaseSettings):
     max_live_analysis_seconds: float = Field(180.0, gt=0)  # infinite analysis auto-stops
     max_review_movetime_ms: int = Field(10_000, ge=100)
 
+    # Interactive engine processes per engine. Each user holds at most one at a
+    # time; with more users than processes, requests wait (up to the timeout).
+    interactive_engine_pool: int = Field(1, ge=1, le=16)
+    engine_queue_timeout_s: float = Field(20.0, gt=0)
+
+    # ---- Background work --------------------------------------------------------
+    run_workers: bool = True  # False when a separate `python -m app.worker` runs them
+    review_workers: int = Field(1, ge=1, le=16)  # engine processes for game reviews
+    job_stale_after_s: float = Field(60.0, ge=15)  # requeue running jobs without heartbeat
+    backup_interval_hours: float = Field(24.0, ge=0)  # SQLite only; 0 disables automatic backups
+    backup_keep: int = Field(7, ge=1, le=365)
+
+    # ---- Per-user quotas (None = unlimited) --------------------------------------
+    max_games_per_user: int | None = None
+    max_reviews_per_day: int | None = None
+    max_active_imports_per_user: int = Field(2, ge=1)
+    max_queued_reviews_per_user: int = Field(200, ge=1)
+
+    # ---- Observability ------------------------------------------------------------
+    metrics_enabled: bool = True
+    metrics_token: str | None = None  # if set, /metrics requires "Authorization: Bearer <token>"
+    hsts: bool = False  # send Strict-Transport-Security (only behind HTTPS)
+
     # ---- Requests & imports ---------------------------------------------------
     max_request_bytes: int = Field(6 * 1024 * 1024, ge=1024)
     max_pgn_bytes: int = Field(5 * 1024 * 1024, ge=1024)
@@ -114,6 +147,18 @@ class Settings(BaseSettings):
         if self.database_url:
             return self.database_url
         return f"sqlite:///{(self.data_dir / 'chesslab.db').as_posix()}"
+
+    @property
+    def cookie_secure(self) -> bool:
+        return self.secure_cookies if self.secure_cookies is not None else self.environment == "production"
+
+    @property
+    def docs_enabled(self) -> bool:
+        return self.expose_api_docs if self.expose_api_docs is not None else self.environment != "production"
+
+    @property
+    def multi_user(self) -> bool:
+        return self.auth_mode != "none"
 
     @property
     def backups_dir(self) -> Path:

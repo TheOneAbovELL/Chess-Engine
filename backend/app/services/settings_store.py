@@ -7,9 +7,10 @@ read, so a settings row can never make the engine exceed configured limits.
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar
 
-from pydantic import BaseModel, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings, default_engine_threads
@@ -93,74 +94,124 @@ class Preferences(BaseModel):
     accounts: list[LinkedAccount] = Field(default_factory=list, max_length=10)
 
 
+class InterfacePrefs(BaseModel):
+    """Per-user interface settings, synced across devices.
+
+    ``experience`` is a preset the UI applies to the feature switches below;
+    every switch can still be changed individually.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    theme: Literal["system", "dark", "light"] = "system"
+    experience: Literal["simple", "standard", "advanced"] = "standard"
+    board_theme: Literal["walnut", "slate", "emerald", "midnight"] = "walnut"
+    coordinates: bool = True
+    animations: bool = True
+    move_sounds: bool = True
+    show_eval_bar: bool = True
+    show_best_arrow: bool = True
+    show_classifications: bool = True
+    show_opening_names: bool = True
+    show_explorer: bool = True
+    show_engine_lab: bool = False
+    show_insights: bool = True
+    analysis_lines: int = Field(1, ge=1, le=5)
+    preferred_engine: Literal["auto", "stockfish", "custom", "browser"] = "auto"
+    onboarded: bool = False
+
+
+_SERVER_WIDE = {"engine"}
 _MODELS: dict[str, type[BaseModel]] = {
     "engine": EngineSettings,
     "classification": ClassificationThresholds,
     "preferences": Preferences,
+    "interface": InterfacePrefs,
 }
+M = TypeVar("M", bound=BaseModel)
 
 
 class SettingsStore:
+    """Reads/writes validated settings. ``engine`` is server-wide; the rest
+    are stored per user."""
+
     def __init__(self, db: Database, settings: Settings) -> None:
         self.db = db
         self.settings = settings
 
-    def _read(self, session: Session, key: str) -> BaseModel:
-        model = _MODELS[key]
-        row = session.get(AppSetting, key)
-        if row is None:
-            return model()
-        try:
-            return model.model_validate(row.value)
-        except ValidationError:
-            # A stored value from an older version that no longer validates:
-            # fall back to defaults instead of breaking the app.
-            return model()
+    @staticmethod
+    def _owner(key: str, user_id: int | None) -> int | None:
+        return None if key in _SERVER_WIDE else user_id
 
-    def _write(self, key: str, value: BaseModel) -> None:
+    def _row(self, session: Session, key: str, user_id: int | None) -> AppSetting | None:
+        owner = self._owner(key, user_id)
+        stmt = select(AppSetting).where(AppSetting.key == key)
+        stmt = stmt.where(AppSetting.user_id.is_(None)) if owner is None else stmt.where(AppSetting.user_id == owner)
+        return session.execute(stmt).scalar_one_or_none()
+
+    def _read(self, key: str, model: type[M], user_id: int | None) -> M:
         with self.db.session() as session:
-            row = session.get(AppSetting, key)
-            payload: dict[str, Any] = value.model_dump(mode="json")
+            row = self._row(session, key, user_id)
             if row is None:
-                session.add(AppSetting(key=key, value=payload))
+                return model()
+            try:
+                return model.model_validate(row.value)
+            except ValidationError:
+                # A stored value from an older version that no longer validates:
+                # fall back to defaults instead of breaking the app.
+                return model()
+
+    def _write(self, key: str, value: BaseModel, user_id: int | None) -> None:
+        payload: dict[str, Any] = value.model_dump(mode="json")
+        with self.db.session() as session:
+            row = self._row(session, key, user_id)
+            if row is None:
+                session.add(AppSetting(key=key, value=payload, user_id=self._owner(key, user_id)))
             else:
                 row.value = payload
 
+    # Server-wide
     def engine(self) -> EngineSettings:
-        with self.db.session() as session:
-            value = self._read(session, "engine")
-        assert isinstance(value, EngineSettings)
-        return value.clamp(self.settings)
+        return self._read("engine", EngineSettings, None).clamp(self.settings)
 
     def set_engine(self, value: EngineSettings) -> EngineSettings:
         value.check_limits(self.settings)
-        self._write("engine", value)
+        self._write("engine", value, None)
         return value
 
-    def thresholds(self) -> ClassificationThresholds:
-        with self.db.session() as session:
-            value = self._read(session, "classification")
-        assert isinstance(value, ClassificationThresholds)
+    # Per user
+    def thresholds(self, user_id: int) -> ClassificationThresholds:
+        return self._read("classification", ClassificationThresholds, user_id)
+
+    def set_thresholds(self, user_id: int, value: ClassificationThresholds) -> ClassificationThresholds:
+        self._write("classification", value, user_id)
         return value
 
-    def set_thresholds(self, value: ClassificationThresholds) -> ClassificationThresholds:
-        self._write("classification", value)
+    def preferences(self, user_id: int) -> Preferences:
+        return self._read("preferences", Preferences, user_id)
+
+    def set_preferences(self, user_id: int, value: Preferences) -> Preferences:
+        self._write("preferences", value, user_id)
         return value
 
-    def preferences(self) -> Preferences:
-        with self.db.session() as session:
-            value = self._read(session, "preferences")
-        assert isinstance(value, Preferences)
+    def interface(self, user_id: int) -> InterfacePrefs:
+        return self._read("interface", InterfacePrefs, user_id)
+
+    def set_interface(self, user_id: int, value: InterfacePrefs) -> InterfacePrefs:
+        self._write("interface", value, user_id)
         return value
 
-    def set_preferences(self, value: Preferences) -> Preferences:
-        self._write("preferences", value)
-        return value
-
-    def remember_account(self, provider: str, username: str) -> None:
-        prefs = self.preferences()
+    def remember_account(self, user_id: int, provider: str, username: str) -> None:
+        prefs = self.preferences(user_id)
         if any(a.provider == provider and a.username.lower() == username.lower() for a in prefs.accounts):
             return
         prefs.accounts.append(LinkedAccount(provider=provider, username=username))  # type: ignore[arg-type]
         prefs.accounts = prefs.accounts[-10:]
-        self.set_preferences(prefs)
+        self.set_preferences(user_id, prefs)
+
+    def export(self, user_id: int) -> dict[str, Any]:
+        return {
+            "classification": self.thresholds(user_id).model_dump(mode="json"),
+            "preferences": self.preferences(user_id).model_dump(mode="json"),
+            "interface": self.interface(user_id).model_dump(mode="json"),
+        }

@@ -6,7 +6,6 @@ inside the app (see app/db/migrate.py), otherwise from ChessLab settings.
 """
 
 from alembic import context
-from sqlalchemy import engine_from_config, pool
 
 import app.models  # noqa: F401  (registers all tables on Base.metadata)
 from app.core.config import Settings
@@ -34,13 +33,13 @@ def run_online() -> None:
         with context.begin_transaction():
             context.run_migrations()
         return
-    section = config.get_section(config.config_ini_section, {})
-    section["sqlalchemy.url"] = _url()
-    engine = engine_from_config(section, prefix="sqlalchemy.", poolclass=pool.NullPool)
-    with engine.connect() as conn:
+    from app.db.migrate import migration_engine
+
+    engine = migration_engine(_url())  # foreign keys off + transactional DDL on SQLite
+    with engine.begin() as conn:
         context.configure(connection=conn, target_metadata=target_metadata, render_as_batch=True)
-        with context.begin_transaction():
-            context.run_migrations()
+        context.run_migrations()
+    engine.dispose()
 
 
 if context.is_offline_mode():

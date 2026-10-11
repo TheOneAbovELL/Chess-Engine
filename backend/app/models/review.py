@@ -18,6 +18,7 @@ class GameReview(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     game_id: Mapped[int] = mapped_column(ForeignKey("games.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     status: Mapped[str] = mapped_column(String(16), index=True, default=QUEUED)
     cancel_requested: Mapped[bool] = mapped_column(default=False)
     engine_id: Mapped[str] = mapped_column(String(16))
@@ -27,6 +28,8 @@ class GameReview(Base):
     progress_done: Mapped[int] = mapped_column(Integer, default=0)
     progress_total: Mapped[int] = mapped_column(Integer, default=0)
     attempts: Mapped[int] = mapped_column(Integer, default=0)
+    worker_id: Mapped[str | None] = mapped_column(String(128))
+    heartbeat_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
     error: Mapped[str | None] = mapped_column(Text)
     summary: Mapped[dict[str, Any] | None] = mapped_column(JSON)
 

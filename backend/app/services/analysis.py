@@ -56,12 +56,13 @@ class AnalysisService:
         limits: SearchLimits,
         multipv: int,
         *,
+        owner: object = "local",
         on_update: UpdateCallback | None = None,
         stop: StopSignal | None = None,
     ) -> AnalysisSnapshot:
-        slot = self.manager.slot(self.manager.resolve_engine_id(engine_id))
+        pool = self.manager.pool(self.manager.resolve_engine_id(engine_id))
         try:
-            async with slot.use(preempt=True, stop=stop) as lease:
+            async with pool.use(owner, stop) as lease:
                 return await lease.analyse(board, limits, multipv=multipv, on_update=on_update)
         except SearchPreemptedError as exc:
             raise ConflictError("Superseded by a newer analysis request.", code="superseded") from exc
@@ -82,6 +83,7 @@ class AnalysisService:
         level: int | None = None,
         depth: int | None = None,
         movetime_ms: int | None = None,
+        owner: object = "local",
     ) -> AnalysisSnapshot:
         if board.is_game_over():
             raise InvalidInputError("The game is already over in this position.", code="game_over")
@@ -96,16 +98,15 @@ class AnalysisService:
             movetime_ms = spec.get("movetime_ms")  # type: ignore[assignment]
             options = dict(spec.get("options", {}))  # type: ignore[call-overload]
         limits = self.limits(depth, movetime_ms, live=False)
-        slot = self.manager.slot(engine_id)
         try:
-            async with slot.use(preempt=True) as lease:
+            async with self.manager.pool(engine_id).use(owner) as lease:
                 return await lease.play(board, limits, options=options)
         except SearchPreemptedError as exc:
             raise ConflictError("Superseded by a newer request.", code="superseded") from exc
 
     # --------------------------------------------------------------- compare
     async def compare(
-        self, board: chess.Board, engine_ids: list[str], limits: SearchLimits, multipv: int
+        self, board: chess.Board, engine_ids: list[str], limits: SearchLimits, multipv: int, owner: object = "local"
     ) -> list[dict[str, Any]]:
         """Run each engine on the same position with the same limits.
 
@@ -115,7 +116,7 @@ class AnalysisService:
         results: list[dict[str, Any]] = []
         for engine_id in engine_ids:
             try:
-                snapshot = await self.analyse(board, engine_id, limits, multipv)
+                snapshot = await self.analyse(board, engine_id, limits, multipv, owner=owner)
                 results.append({"engine_id": engine_id, "snapshot": snapshot, "error": None})
             except (EngineUnavailableError, ConflictError) as exc:
                 results.append({"engine_id": engine_id, "snapshot": None, "error": exc.message})

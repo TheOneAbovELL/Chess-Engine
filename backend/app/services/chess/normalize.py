@@ -56,6 +56,7 @@ class GameRecord:
     owner_username: str | None = None
     user_color: str | None = None
     user_result: str | None = None
+    opening_version: int | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
     def as_model_kwargs(self) -> dict[str, Any]:

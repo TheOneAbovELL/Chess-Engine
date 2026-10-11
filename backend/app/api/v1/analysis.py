@@ -11,12 +11,14 @@ from typing import Any
 from urllib.parse import urlparse
 
 import chess
-from fastapi import APIRouter, Depends, Request, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, Query, Request, WebSocket, WebSocketDisconnect
 from pydantic import ValidationError
 
-from app.api.deps import client_key, container
+from app.api.deps import container, current_user, rate_key
 from app.core.container import Container
 from app.core.errors import AppError
+from app.services.auth import LOCAL_USER, SESSION_COOKIE, CurrentUser
+from app.services.chess.openings import book
 from app.services.chess.pgn import game_tree, parse_single_game
 from app.services.chess.positions import board_from_request, position_status
 from app.services.engine.runtime import StopSignal
@@ -32,11 +34,13 @@ from .schemas import (
     PgnText,
     PositionInfo,
     PositionRequest,
+    UciMove,
 )
 
 router = APIRouter()
 log = logging.getLogger("chesslab.api.analysis")
-MAX_LIVE_CONNECTIONS = 4
+MAX_LIVE_PER_USER = 4
+MAX_LIVE_TOTAL = 200
 
 
 @router.post("/positions/validate", response_model=PositionInfo, summary="Validate a position and list legal moves")
@@ -55,6 +59,16 @@ def validate_position(body: PositionRequest) -> PositionInfo:
     )
 
 
+@router.get("/openings/classify", summary="Opening name for a line of moves (Lichess chess-openings, CC0)")
+def classify_opening(
+    fen: str | None = Query(None, max_length=100),
+    moves: list[UciMove] = Query(default_factory=list, max_length=80),
+) -> dict[str, Any]:
+    board_from_request(fen, moves)  # validates the line
+    opening = book.classify(fen, list(moves))
+    return {"eco": opening.eco, "name": opening.name} if opening else {"eco": None, "name": None}
+
+
 @router.post("/pgn/parse", response_model=PgnParseResponse, summary="Parse a PGN (first game) into a move tree")
 def parse_pgn(body: PgnText, c: Container = Depends(container)) -> PgnParseResponse:
     if len(body.pgn.encode("utf-8")) > c.settings.max_pgn_bytes:
@@ -64,28 +78,43 @@ def parse_pgn(body: PgnText, c: Container = Depends(container)) -> PgnParseRespo
 
 
 @router.post("/analysis", response_model=AnalysisSnapshot, summary="Analyse a position (bounded, waits for the result)")
-async def analyse(body: AnalyzeRequest, request: Request, c: Container = Depends(container)) -> AnalysisSnapshot:
-    c.limiter.check(client_key(request))
+async def analyse(
+    body: AnalyzeRequest,
+    request: Request,
+    c: Container = Depends(container),
+    user: CurrentUser = Depends(current_user),
+) -> AnalysisSnapshot:
+    c.limiter.check(rate_key(request, user))
     board = board_from_request(body.fen, body.moves)
     limits = c.analysis.limits(body.depth or (None if body.movetime_ms else 18), body.movetime_ms, live=False)
-    return await c.analysis.analyse(board, body.engine, limits, c.analysis.multipv(body.multipv))
+    return await c.analysis.analyse(board, body.engine, limits, c.analysis.multipv(body.multipv), owner=user.id)
 
 
 @router.post("/analysis/best-move", response_model=AnalysisSnapshot, summary="Engine move for play mode")
-async def best_move(body: BestMoveRequest, request: Request, c: Container = Depends(container)) -> AnalysisSnapshot:
-    c.limiter.check(client_key(request))
+async def best_move(
+    body: BestMoveRequest,
+    request: Request,
+    c: Container = Depends(container),
+    user: CurrentUser = Depends(current_user),
+) -> AnalysisSnapshot:
+    c.limiter.check(rate_key(request, user))
     board = board_from_request(body.fen, body.moves)
     return await c.analysis.best_move(
-        board, body.engine, level=body.level, depth=body.depth, movetime_ms=body.movetime_ms
+        board, body.engine, level=body.level, depth=body.depth, movetime_ms=body.movetime_ms, owner=user.id
     )
 
 
 @router.post("/analysis/compare", response_model=list[CompareResult], summary="Run engines on the same position")
-async def compare(body: CompareRequest, request: Request, c: Container = Depends(container)) -> list[dict[str, Any]]:
-    c.limiter.check(client_key(request))
+async def compare(
+    body: CompareRequest,
+    request: Request,
+    c: Container = Depends(container),
+    user: CurrentUser = Depends(current_user),
+) -> list[dict[str, Any]]:
+    c.limiter.check(rate_key(request, user))
     board = board_from_request(body.fen, body.moves)
     limits = c.analysis.limits(body.depth or (None if body.movetime_ms else 4), body.movetime_ms or 10_000, live=False)
-    return await c.analysis.compare(board, list(dict.fromkeys(body.engines)), limits, body.multipv)
+    return await c.analysis.compare(board, list(dict.fromkeys(body.engines)), limits, body.multipv, owner=user.id)
 
 
 def _origin_allowed(ws: WebSocket, allowed: list[str]) -> bool:
@@ -96,6 +125,12 @@ def _origin_allowed(ws: WebSocket, allowed: list[str]) -> bool:
         return True
     host = ws.headers.get("host", "")
     return origin in allowed or urlparse(origin).netloc == host
+
+
+async def _refuse(ws: WebSocket, code: str, message: str, close_code: int) -> None:
+    await ws.accept()
+    await ws.send_json({"type": "error", "request_id": None, "code": code, "message": message})
+    await ws.close(code=close_code)
 
 
 @router.websocket("/analysis/live")
@@ -111,24 +146,21 @@ async def live_analysis(ws: WebSocket) -> None:
     if not _origin_allowed(ws, c.settings.cors_origins):
         await ws.close(code=1008)
         return
-    if c.live_connections >= MAX_LIVE_CONNECTIONS:
-        await ws.accept()
-        await ws.send_json(
-            {
-                "type": "error",
-                "request_id": None,
-                "code": "too_many_connections",
-                "message": "Too many live analysis connections.",
-            }
-        )
-        await ws.close(code=1013)
+    user: CurrentUser | None = LOCAL_USER
+    if c.settings.multi_user:
+        user = await asyncio.to_thread(c.auth.resolve, ws.cookies.get(SESSION_COOKIE))
+    if user is None:
+        await _refuse(ws, "auth_required", "Please sign in.", 4401)
+        return
+    if c.live_connections.get(user.id, 0) >= MAX_LIVE_PER_USER or c.live_total >= MAX_LIVE_TOTAL:
+        await _refuse(ws, "too_many_connections", "Too many live analysis connections.", 1013)
         return
     await ws.accept()
-    c.live_connections += 1
+    c.live_connections[user.id] = c.live_connections.get(user.id, 0) + 1
     outgoing: asyncio.Queue[tuple[str, str | None, Any]] = asyncio.Queue()
     current: asyncio.Task[None] | None = None
     current_stop: StopSignal | None = None
-    key = ws.client.host if ws.client else "unknown"
+    key = f"user:{user.id}" if user is not LOCAL_USER else f"ip:{ws.client.host if ws.client else 'unknown'}"
 
     async def sender() -> None:
         while True:
@@ -159,6 +191,7 @@ async def live_analysis(ws: WebSocket) -> None:
                 req.engine,
                 limits,
                 c.analysis.multipv(req.multipv),
+                owner=user.id,
                 on_update=lambda snap: outgoing.put_nowait(("update", request_id, snap)),
                 stop=stop,
             )
@@ -212,7 +245,11 @@ async def live_analysis(ws: WebSocket) -> None:
     except (WebSocketDisconnect, RuntimeError):
         pass
     finally:
-        c.live_connections -= 1
+        remaining = c.live_connections.get(user.id, 1) - 1
+        if remaining > 0:
+            c.live_connections[user.id] = remaining
+        else:
+            c.live_connections.pop(user.id, None)
         if current_stop is not None:
             current_stop.request()
         if current is not None:

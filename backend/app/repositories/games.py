@@ -90,20 +90,26 @@ def _order(stmt: Select, sort: SortKey) -> Select:  # type: ignore[type-arg]
 
 
 class GameRepository:
-    def __init__(self, session: Session) -> None:
+    """Every query is scoped to one user's library."""
+
+    def __init__(self, session: Session, user_id: int) -> None:
         self.session = session
+        self.user_id = user_id
+
+    def _mine(self, stmt: Select) -> Select:  # type: ignore[type-arg]
+        return stmt.where(Game.user_id == self.user_id)
 
     def exists(self, source: str, external_id: str) -> bool:
-        stmt = select(Game.id).where(Game.source == source, Game.external_id == external_id)
+        stmt = self._mine(select(Game.id).where(Game.source == source, Game.external_id == external_id))
         return self.session.execute(stmt).first() is not None
 
     def insert(self, record: GameRecord, import_job_id: str | None = None) -> Game | None:
-        """Insert a game unless ``(source, external_id)`` already exists.
+        """Insert a game unless ``(user, source, external_id)`` already exists.
         Returns None for duplicates. Uses a savepoint so a race on the unique
         constraint only rolls back this one row."""
         if self.exists(record.source, record.external_id):
             return None
-        game = Game(**record.as_model_kwargs(), import_job_id=import_job_id)
+        game = Game(**record.as_model_kwargs(), import_job_id=import_job_id, user_id=self.user_id)
         try:
             with self.session.begin_nested():
                 self.session.add(game)
@@ -113,49 +119,52 @@ class GameRepository:
         return game
 
     def get(self, game_id: int) -> Game | None:
-        return self.session.get(Game, game_id)
+        game = self.session.get(Game, game_id)
+        return game if game is not None and game.user_id == self.user_id else None
 
     def page(self, f: GameFilters, *, sort: SortKey, offset: int, limit: int) -> tuple[list[Game], int]:
-        total = self.session.execute(apply_filters(select(func.count(Game.id)), f)).scalar_one()
-        stmt = _order(apply_filters(select(Game), f), sort).offset(offset).limit(limit)
+        total = self.session.execute(self._mine(apply_filters(select(func.count(Game.id)), f))).scalar_one()
+        stmt = _order(self._mine(apply_filters(select(Game), f)), sort).offset(offset).limit(limit)
         return list(self.session.execute(stmt).scalars()), int(total)
 
     def iterate(self, f: GameFilters, *, sort: SortKey = "played_asc", limit: int | None = None) -> list[Game]:
-        stmt = _order(apply_filters(select(Game), f), sort)
+        stmt = _order(self._mine(apply_filters(select(Game), f)), sort)
         if limit:
             stmt = stmt.limit(limit)
         return list(self.session.execute(stmt).scalars())
 
     def delete(self, game_id: int) -> bool:
-        result = self.session.execute(delete(Game).where(Game.id == game_id))
+        result = self.session.execute(delete(Game).where(Game.id == game_id, Game.user_id == self.user_id))
         return bool(result.rowcount)  # type: ignore[attr-defined]
 
     def delete_many(self, ids: list[int]) -> int:
-        result = self.session.execute(delete(Game).where(Game.id.in_(ids)))
+        result = self.session.execute(delete(Game).where(Game.id.in_(ids), Game.user_id == self.user_id))
         return int(result.rowcount)  # type: ignore[attr-defined]
 
     def delete_all(self) -> int:
-        result = self.session.execute(delete(Game))
+        result = self.session.execute(delete(Game).where(Game.user_id == self.user_id))
         return int(result.rowcount)  # type: ignore[attr-defined]
 
     def latest_played_at(self, source: str, owner: str) -> datetime | None:
-        stmt = select(func.max(Game.played_at)).where(Game.source == source, Game.owner_username == owner.lower())
+        stmt = self._mine(
+            select(func.max(Game.played_at)).where(Game.source == source, Game.owner_username == owner.lower())
+        )
         return self.session.execute(stmt).scalar_one_or_none()
 
     def count(self) -> int:
-        return int(self.session.execute(select(func.count(Game.id))).scalar_one())
+        return int(self.session.execute(self._mine(select(func.count(Game.id)))).scalar_one())
 
-    def version_key(self) -> tuple[int, int, str]:
-        """Changes whenever games are added or removed (for in-memory caches)."""
+    def version_key(self) -> tuple[int, int, int, str]:
+        """Changes whenever this user's games are added or removed (for in-memory caches)."""
         count, max_id, max_imported = self.session.execute(
-            select(func.count(Game.id), func.max(Game.id), func.max(Game.imported_at))
+            self._mine(select(func.count(Game.id), func.max(Game.id), func.max(Game.imported_at)))
         ).one()
-        return int(count), int(max_id or 0), str(max_imported)
+        return self.user_id, int(count), int(max_id or 0), str(max_imported)
 
     def owners(self) -> list[tuple[str, str, int]]:
         stmt = (
             select(Game.source, Game.owner_username, func.count(Game.id))
-            .where(Game.owner_username.is_not(None))
+            .where(Game.owner_username.is_not(None), Game.user_id == self.user_id)
             .group_by(Game.source, Game.owner_username)
             .order_by(func.count(Game.id).desc())
         )

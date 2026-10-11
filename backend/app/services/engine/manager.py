@@ -2,16 +2,17 @@
 
 Resource model
 --------------
-At most one process exists per *(engine, purpose)* slot:
+Engine processes live in *slots* keyed by (engine, purpose, index):
 
-* ``(stockfish, interactive)`` - live analysis, play, comparisons
-* ``(custom, interactive)``    - the same for ChessLab's engine
-* ``(<review engine>, review)`` - the background game-review worker
+* interactive pool per engine: ``interactive_engine_pool`` processes (default 1)
+  for live analysis, play and comparisons;
+* one review process per review worker (``review_workers``, default 1).
 
-So the app never runs more than three engine processes, however many
-requests arrive. Each slot serialises work with a lock. Interactive work is
-*preemptive*: a new request asks the running search to stop and then takes
-over, so clicking through positions never queues up stale searches.
+The number of processes is therefore fixed by configuration, never by load.
+Each slot serialises work with a lock. In the interactive pool every user
+holds at most one engine: a user's new request *preempts their own* previous
+search (so clicking through positions never queues stale searches), while
+requests from other users wait for a free engine, fairly and with a timeout.
 
 Processes start lazily, are restarted automatically after a crash, and are shut
 down after ``engine_idle_shutdown_s`` of inactivity to free memory.
@@ -40,10 +41,15 @@ from .stockfish import StockfishEngine, discover_stockfish
 from .types import ENGINE_IDS, AnalysisSnapshot, EngineCapabilities, EngineDescriptor, SearchLimits
 
 Purpose = Literal["interactive", "review"]
+SlotKey = tuple[str, Purpose, int]
 
 
 class SearchPreemptedError(Exception):
     """A newer request took over the engine before this one started."""
+
+
+class EngineBusyError(EngineUnavailableError):
+    code = "engine_busy"
 
 
 log = logging.getLogger("chesslab.engine")
@@ -102,6 +108,69 @@ class EngineSlot:
                 self.last_used = time.monotonic()
 
 
+class EnginePool:
+    """A fixed set of interactive engine slots shared fairly between users."""
+
+    def __init__(self, slots: list[EngineSlot], timeout_s: float) -> None:
+        self.slots = slots
+        self.timeout_s = timeout_s
+        self._cond = asyncio.Condition()
+        self._holders: dict[int, tuple[object, StopSignal]] = {}
+
+    @property
+    def in_use(self) -> int:
+        return len(self._holders)
+
+    def _held_by(self, owner: object) -> int | None:
+        return next((i for i, (o, _s) in self._holders.items() if o == owner), None)
+
+    def stop(self, owner: object) -> bool:
+        """Stop this owner's running search (never anyone else's)."""
+        index = self._held_by(owner)
+        if index is None:
+            return False
+        self._holders[index][1].request()
+        return True
+
+    def _free(self) -> int | None:
+        return next((i for i in range(len(self.slots)) if i not in self._holders), None)
+
+    @contextlib.asynccontextmanager
+    async def use(self, owner: object, stop: StopSignal | None = None) -> AsyncIterator[EngineLease]:
+        stop = stop or StopSignal()
+        async with self._cond:
+            index = self._held_by(owner)
+            if index is not None:
+                # Same user again: stop their previous search and take its engine.
+                self._holders[index][1].request()
+                current = self.slots[index].current_stop
+                if current is not None:
+                    current.request()
+            else:
+                loop = asyncio.get_running_loop()
+                deadline = loop.time() + self.timeout_s
+                while (index := self._free()) is None:
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        raise EngineBusyError(
+                            "All engines are busy right now. Try again in a moment, or use the in-browser engine."
+                        )
+                    try:
+                        await asyncio.wait_for(self._cond.wait(), remaining)
+                    except TimeoutError:
+                        continue
+            self._holders[index] = (owner, stop)
+        try:
+            async with self.slots[index].use(preempt=False, stop=stop) as lease:
+                yield lease
+        finally:
+            async with self._cond:
+                held = self._holders.get(index)
+                if held is not None and held[1] is stop:
+                    del self._holders[index]
+                self._cond.notify_all()
+
+
 class EngineManager:
     def __init__(self, settings: Settings, runtime: EngineRuntime, engine_settings: EngineSettings) -> None:
         self.settings = settings
@@ -109,7 +178,8 @@ class EngineManager:
         self.engine_settings = engine_settings
         self.stockfish_path: Path | None = discover_stockfish(settings)
         self.custom_available = settings.custom_engine_enabled and custom_engine_installed()
-        self._slots: dict[tuple[str, Purpose], EngineSlot] = {}
+        self._slots: dict[SlotKey, EngineSlot] = {}
+        self._pools: dict[str, EnginePool] = {}
         self._reaper: asyncio.Task[None] | None = None
         if self.stockfish_path is None:
             log.warning("Stockfish not found; set CHESSLAB_STOCKFISH_PATH or run scripts/install_stockfish.ps1")
@@ -165,17 +235,28 @@ class EngineManager:
             )
         return CustomChessEngine(self.runtime, hash_mb=options["Hash"], start_timeout_s=timeout, low_priority=low)
 
-    def slot(self, engine_id: str, purpose: Purpose = "interactive") -> EngineSlot:
+    def slot(self, engine_id: str, purpose: Purpose = "interactive", index: int = 0) -> EngineSlot:
         engine_id = self.resolve_engine_id(engine_id)
-        key = (engine_id, purpose)
+        key: SlotKey = (engine_id, purpose, index)
         if key not in self._slots:
             if purpose == "review":
-                # Only one review engine process at a time, whichever engine it is.
-                for other in [k for k in self._slots if k[1] == "review" and k[0] != engine_id]:
+                # One review process per review worker, whichever engine it uses.
+                for other in [k for k in self._slots if k[1] == "review" and k[2] == index and k[0] != engine_id]:
                     old = self._slots.pop(other)
                     asyncio.get_running_loop().create_task(self._close_slot(old))
             self._slots[key] = EngineSlot(self._create(engine_id, purpose))
         return self._slots[key]
+
+    def pool(self, engine_id: str) -> EnginePool:
+        engine_id = self.resolve_engine_id(engine_id)
+        if engine_id not in self._pools:
+            size = self.settings.interactive_engine_pool
+            slots = [self.slot(engine_id, "interactive", i) for i in range(size)]
+            self._pools[engine_id] = EnginePool(slots, self.settings.engine_queue_timeout_s)
+        return self._pools[engine_id]
+
+    def pools(self) -> dict[str, EnginePool]:
+        return dict(self._pools)
 
     async def _close_slot(self, slot: EngineSlot) -> None:
         async with slot.lock:
@@ -184,7 +265,7 @@ class EngineManager:
     # ------------------------------------------------------------- settings
     async def apply_settings(self, new: EngineSettings) -> None:
         self.engine_settings = new
-        for (engine_id, purpose), slot in list(self._slots.items()):
+        for (engine_id, purpose, _index), slot in list(self._slots.items()):
             options = self._options_for(engine_id, purpose)
             if slot.current_stop is not None:
                 slot.current_stop.request()
@@ -224,13 +305,14 @@ class EngineManager:
             except Exception:
                 log.exception("error stopping engine", extra={"engine": slot.engine.engine_id})
         self._slots.clear()
+        self._pools.clear()
 
     # ------------------------------------------------------------- describe
     def describe(self) -> list[EngineDescriptor]:
         result = []
         for engine_id in ENGINE_IDS:
             available = self.is_available(engine_id)
-            slot = self._slots.get((engine_id, "interactive"))
+            slot = self._slots.get((engine_id, "interactive", 0))
             engine = slot.engine if slot else None
             status: str
             if not available:

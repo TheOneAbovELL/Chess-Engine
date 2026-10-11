@@ -13,12 +13,14 @@ import sqlite3
 from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from alembic import command
 from alembic.config import Config
 from alembic.runtime.migration import MigrationContext
 from alembic.script import ScriptDirectory
-from sqlalchemy import inspect
+from sqlalchemy import Engine, create_engine, event, inspect
+from sqlalchemy.pool import NullPool
 
 from app.core.config import BACKEND_ROOT, Settings
 
@@ -74,7 +76,49 @@ def run_migrations(db: Database, settings: Settings) -> None:
             "Back it up and point CHESSLAB_DATABASE_URL at a new file, or stamp it manually."
         )
 
-    with db.engine.begin() as conn:
-        cfg.attributes["connection"] = conn
-        command.upgrade(cfg, "head")
+    engine = migration_engine(db.url)
+    try:
+        with engine.begin() as conn:
+            if engine.dialect.name == "postgresql":
+                # Web and worker processes may start together: one migrates,
+                # the other waits here and then finds nothing left to do.
+                conn.exec_driver_sql("SELECT pg_advisory_xact_lock(7262701)")
+            cfg.attributes["connection"] = conn
+            command.upgrade(cfg, "head")
+            if engine.dialect.name == "sqlite":
+                problems = conn.exec_driver_sql("PRAGMA foreign_key_check").fetchall()
+                if problems:  # raising rolls the whole migration back
+                    raise RuntimeError(f"Migration left {len(problems)} foreign-key violations; rolled back.")
+    finally:
+        engine.dispose()
     log.info("database migrated", extra={"from": current, "to": head})
+
+
+def migration_engine(url: str) -> Engine:
+    """Engine used only for schema migrations.
+
+    SQLite needs two adjustments to migrate safely:
+
+    * **Foreign keys off.** Alembic changes SQLite tables by copying them and
+      dropping the original; with enforcement on, dropping ``games`` would
+      cascade-delete every review. Integrity is verified afterwards with
+      ``PRAGMA foreign_key_check`` instead.
+    * **Transactional DDL.** The sqlite3 module never wraps DDL in a
+      transaction, so a failing migration would be left half-applied. Taking
+      over transaction control makes the whole upgrade atomic.
+    """
+    if not url.startswith("sqlite"):
+        return create_engine(url, poolclass=NullPool)
+    engine = create_engine(url, poolclass=NullPool, connect_args={"timeout": 30})
+
+    @event.listens_for(engine, "connect")
+    def _connect(dbapi_connection: Any, _record: Any) -> None:
+        dbapi_connection.isolation_level = None  # SQLAlchemy issues BEGIN itself
+        dbapi_connection.execute("PRAGMA foreign_keys=OFF")
+        dbapi_connection.execute("PRAGMA busy_timeout=30000")
+
+    @event.listens_for(engine, "begin")
+    def _begin(conn: Any) -> None:
+        conn.exec_driver_sql("BEGIN IMMEDIATE")
+
+    return engine

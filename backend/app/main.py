@@ -6,78 +6,30 @@ Run locally:  ``uvicorn app.main:app --reload`` (from ``backend/``) or use
 
 from __future__ import annotations
 
-import asyncio
+import ipaddress
 import logging
-import ssl
+import secrets
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
+from urllib.parse import urlparse
 
-import certifi
-import httpx
-from fastapi import APIRouter, FastAPI
+from fastapi import APIRouter, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from app.api.v1 import analysis, games, imports, insights, system
+from app.api.v1 import analysis, auth, games, imports, insights, system
+from app.core.bootstrap import ProviderFactory, build_container, default_providers, shutdown, start_workers
 from app.core.config import APP_VERSION, Settings
 from app.core.container import Container
 from app.core.errors import error_body, install_error_handlers
 from app.core.logging import configure_logging
-from app.core.ratelimit import RateLimiter
-from app.db.migrate import run_migrations
-from app.db.session import Database
-from app.services.analysis import AnalysisService
-from app.services.engine.manager import EngineManager
-from app.services.engine.runtime import EngineRuntime
-from app.services.games import GameService
-from app.services.imports import GameImportService
-from app.services.providers.base import ChessHistoryProvider
-from app.services.providers.chesscom import ChessComProvider
-from app.services.providers.http import PoliteClient
-from app.services.providers.lichess import LichessProvider
-from app.services.review.service import GameReviewService
-from app.services.settings_store import SettingsStore
-from app.services.statistics.service import ExplorerService, StatisticsService
+from app.core.observability import Metrics, RequestContextMiddleware, install_request_id_logging
 
+__all__ = ["create_app", "default_providers"]
 log = logging.getLogger("chesslab")
-ProviderFactory = Any  # Callable[[Settings], tuple[dict[str, ChessHistoryProvider], list[httpx.AsyncClient]]]
-
-
-def default_providers(settings: Settings) -> tuple[dict[str, ChessHistoryProvider], list[httpx.AsyncClient]]:
-    # One verified TLS context for both clients: loading the CA bundle is the
-    # slowest part of creating an HTTPS client.
-    tls = ssl.create_default_context(cafile=certifi.where())
-
-    def client() -> httpx.AsyncClient:
-        return httpx.AsyncClient(
-            headers={"User-Agent": settings.user_agent, "Accept-Encoding": "gzip"},
-            timeout=httpx.Timeout(settings.http_timeout_s, connect=10.0),
-            follow_redirects=True,
-            verify=tls,
-        )
-
-    chesscom_client, lichess_client = client(), client()
-    providers: dict[str, ChessHistoryProvider] = {
-        "chesscom": ChessComProvider(
-            PoliteClient(
-                chesscom_client,
-                provider_name="Chess.com",
-                max_retries=settings.http_max_retries,
-                rate_limit_wait_s=10.0,
-            ),
-            settings.chesscom_base_url,
-        ),
-        "lichess": LichessProvider(
-            # Lichess: "wait a full minute" after a 429.
-            PoliteClient(
-                lichess_client, provider_name="Lichess", max_retries=settings.http_max_retries, rate_limit_wait_s=60.0
-            ),
-            settings.lichess_base_url,
-        ),
-    }
-    return providers, [chesscom_client, lichess_client]
+UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 
 
 class BodySizeLimitMiddleware:
@@ -120,20 +72,64 @@ class _TooLarge(Exception):
     pass
 
 
-class SecurityHeadersMiddleware:
-    CSP = (
-        "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; "
-        "font-src 'self' data:; connect-src 'self' ws: wss:; frame-ancestors 'none'; base-uri 'self'"
-    )
+class OriginCheckMiddleware:
+    """CSRF protection for state-changing requests.
 
-    def __init__(self, app: ASGIApp) -> None:
+    Browsers attach ``Origin`` (or at least ``Sec-Fetch-Site``) to cross-site
+    POST/PUT/DELETE requests, so a request is refused when it demonstrably comes
+    from another site. Same-origin requests and non-browser clients (scripts,
+    curl) pass. Together with SameSite=Lax session cookies this blocks
+    cross-site request forgery - also against the account-less local mode,
+    where any web page could otherwise POST to ``localhost``.
+    """
+
+    def __init__(self, app: ASGIApp, allowed: list[str]) -> None:
         self.app = app
+        self.allowed = set(allowed)
+
+    def _ok(self, scope: Scope) -> bool:
+        headers = {k.decode("latin-1"): v.decode("latin-1") for k, v in scope.get("headers", [])}
+        origin = headers.get("origin")
+        if not origin and headers.get("referer"):
+            parsed = urlparse(headers["referer"])
+            origin = f"{parsed.scheme}://{parsed.netloc}"
+        if origin and origin != "null":
+            return origin in self.allowed or urlparse(origin).netloc == headers.get("host", "")
+        if origin == "null":
+            return False
+        return headers.get("sec-fetch-site", "same-origin") in ("same-origin", "none")
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http" and scope.get("method") in UNSAFE_METHODS and not self._ok(scope):
+            response = JSONResponse(
+                error_body("cross_site_request", "Cross-site requests are not allowed."), status_code=403
+            )
+            await response(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
+
+
+class SecurityHeadersMiddleware:
+    # 'wasm-unsafe-eval' lets the optional in-browser Stockfish (WebAssembly) compile;
+    # it does not allow JavaScript eval.
+    CSP = (
+        "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:; "
+        "img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; "
+        "connect-src 'self' ws: wss:; manifest-src 'self'; frame-ancestors 'none'; base-uri 'self'; "
+        "form-action 'self'; object-src 'none'"
+    )
+    PERMISSIONS = "camera=(), microphone=(), geolocation=(), payment=(), usb=()"
+
+    def __init__(self, app: ASGIApp, hsts: bool) -> None:
+        self.app = app
+        self.hsts = hsts
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
-        is_docs = scope.get("path", "").startswith("/api/docs") or scope.get("path", "").startswith("/api/redoc")
+        path = scope.get("path", "")
+        is_docs = path.startswith("/api/docs")
 
         async def send_with_headers(message: Message) -> None:
             if message["type"] == "http.response.start":
@@ -142,7 +138,13 @@ class SecurityHeadersMiddleware:
                     (b"x-content-type-options", b"nosniff"),
                     (b"x-frame-options", b"DENY"),
                     (b"referrer-policy", b"no-referrer"),
+                    (b"permissions-policy", self.PERMISSIONS.encode()),
+                    (b"cross-origin-opener-policy", b"same-origin"),
                 ]
+                if self.hsts:
+                    headers.append((b"strict-transport-security", b"max-age=31536000; includeSubDomains"))
+                if path.startswith("/api/"):
+                    headers.append((b"cache-control", b"no-store"))
                 if not is_docs:  # Swagger UI loads its assets from a CDN
                     headers.append((b"content-security-policy", self.CSP.encode()))
                 message["headers"] = headers
@@ -151,54 +153,45 @@ class SecurityHeadersMiddleware:
         await self.app(scope, receive, send_with_headers)
 
 
+def _private_client(request: Request) -> bool:
+    host = request.client.host if request.client else ""
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return host in ("testclient", "localhost")
+    return address.is_loopback or address.is_private
+
+
 def create_app(settings: Settings | None = None, *, provider_factory: ProviderFactory | None = None) -> FastAPI:
     settings = settings or Settings()
     configure_logging(settings)
+    install_request_id_logging()
     settings.ensure_directories()
+    metrics = Metrics()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        db = Database(settings.resolved_database_url)
-        await asyncio.to_thread(run_migrations, db, settings)
-        store = SettingsStore(db, settings)
-        runtime = EngineRuntime()
-        runtime.start()
-        engines = EngineManager(settings, runtime, await asyncio.to_thread(store.engine))
-        engines.start()
-        providers, clients = (provider_factory or default_providers)(settings)
-        import_service = GameImportService(db, settings, providers, store)
-        review_service = GameReviewService(db, settings, engines, store)
-        app.state.container = Container(
-            settings=settings,
-            db=db,
-            store=store,
-            runtime=runtime,
-            engines=engines,
-            analysis=AnalysisService(engines, settings),
-            games=GameService(db, settings),
-            providers=providers,
-            imports=import_service,
-            reviews=review_service,
-            stats=StatisticsService(db),
-            explorer=ExplorerService(db),
-            limiter=RateLimiter(settings.analysis_rate_per_minute),
-            http_clients=clients,
+        # The metrics registry exists before startup: the request middleware records into it.
+        container = await build_container(settings, provider_factory, metrics=metrics)
+        app.state.container = container
+        if settings.run_workers:
+            start_workers(container)
+        log.info(
+            "ChessLab started",
+            extra={
+                "version": APP_VERSION,
+                "environment": settings.environment,
+                "auth_mode": settings.auth_mode,
+                "workers": settings.run_workers,
+            },
         )
-        import_service.start()
-        review_service.start()
-        log.info("ChessLab started", extra={"version": APP_VERSION, "environment": settings.environment})
         try:
             yield
         finally:
-            await import_service.stop()
-            await review_service.stop()
-            await engines.shutdown()
-            runtime.stop()
-            for http_client in clients:
-                await http_client.aclose()
-            db.dispose()
+            await shutdown(container)
             log.info("ChessLab stopped")
 
+    docs = settings.docs_enabled
     app = FastAPI(
         title="ChessLab API",
         version=APP_VERSION,
@@ -206,29 +199,48 @@ def create_app(settings: Settings | None = None, *, provider_factory: ProviderFa
             "Local-first chess analysis: Stockfish and a custom engine, Chess.com/Lichess imports, game review."
         ),
         lifespan=lifespan,
-        docs_url="/api/docs",
+        docs_url="/api/docs" if docs else None,
         redoc_url=None,
-        openapi_url="/api/openapi.json",
+        openapi_url="/api/openapi.json" if docs else None,
     )
     install_error_handlers(app)
+    # Middleware runs outermost-last-added: request context wraps everything.
     app.add_middleware(BodySizeLimitMiddleware, max_bytes=settings.max_request_bytes)
-    app.add_middleware(SecurityHeadersMiddleware)
+    app.add_middleware(OriginCheckMiddleware, allowed=settings.cors_origins)
+    app.add_middleware(SecurityHeadersMiddleware, hsts=settings.hsts)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origins,
         allow_methods=["GET", "POST", "PUT", "DELETE"],
-        allow_headers=["Content-Type"],
-        allow_credentials=False,
+        allow_headers=["Content-Type", "X-Request-ID"],
+        allow_credentials=settings.multi_user,
     )
+    app.add_middleware(RequestContextMiddleware, metrics=metrics)
 
     api = APIRouter(prefix="/api/v1")
-    for module in (system, analysis, games, imports, insights):
+    for module in (system, auth, analysis, games, imports, insights):
         api.include_router(module.router)
     app.include_router(api)
+
+    @app.get("/metrics", include_in_schema=False)
+    def prometheus_metrics(request: Request) -> Any:
+        if not settings.metrics_enabled:
+            return JSONResponse(error_body("not_found", "Not found."), status_code=404)
+        token = settings.metrics_token
+        if token:
+            supplied = request.headers.get("authorization", "")
+            if not secrets.compare_digest(supplied.encode(), f"Bearer {token}".encode()):
+                return JSONResponse(error_body("unauthorized", "Metrics token required."), status_code=401)
+        elif not _private_client(request):
+            # Without a token, metrics are only served to the local machine/network.
+            return JSONResponse(error_body("not_found", "Not found."), status_code=404)
+        c: Container = request.app.state.container
+        return PlainTextResponse(c.metrics.render(), media_type="text/plain; version=0.0.4")
 
     dist = settings.frontend_dist
     if settings.serve_frontend and (dist / "index.html").is_file():
         index = dist / "index.html"
+        immutable = {"Cache-Control": "public, max-age=31536000, immutable"}
 
         @app.get("/{path:path}", include_in_schema=False)
         async def spa(path: str) -> Any:
@@ -237,8 +249,10 @@ def create_app(settings: Settings | None = None, *, provider_factory: ProviderFa
             candidate = (dist / path).resolve()
             # Serve real files inside dist only (no path traversal); otherwise the SPA shell.
             if path and candidate.is_file() and candidate.is_relative_to(dist):
-                return FileResponse(candidate)
-            return FileResponse(index)
+                # Vite fingerprints everything under assets/, so it can be cached forever.
+                headers = immutable if path.startswith("assets/") else {"Cache-Control": "no-cache"}
+                return FileResponse(candidate, headers=headers)
+            return FileResponse(index, headers={"Cache-Control": "no-cache"})
 
     return app
 

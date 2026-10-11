@@ -17,6 +17,7 @@ from app.models import Game, GameReview, HttpCacheEntry
 from app.repositories.games import GameFilters, GameRepository, SortKey
 
 from .chess.normalize import UnsupportedGameError, normalize_game
+from .chess.openings import name_opening
 from .chess.pgn import MalformedGameError, ParseFailure, iter_pgn_games, mainline_moves, parse_single_game
 
 MAX_REPORTED_ERRORS = 50
@@ -45,7 +46,9 @@ class GameService:
         self.db = db
         self.settings = settings
 
-    def import_pgn(self, text: str, *, owner: str | None = None, source_override: str | None = None) -> UploadSummary:
+    def import_pgn(
+        self, user_id: int, text: str, *, owner: str | None = None, source_override: str | None = None
+    ) -> UploadSummary:
         """Import every game in a (multi-game) PGN text.
 
         Games with Chess.com / Lichess links keep that source and id, so they
@@ -58,7 +61,8 @@ class GameService:
             )
         summary = UploadSummary()
         with self.db.session() as session:
-            repo = GameRepository(session)
+            repo = GameRepository(session, user_id)
+            room = self.library_room(repo)
             for item in iter_pgn_games(text, self.settings.max_pgn_games_per_upload):
                 summary.total += 1
                 if isinstance(item, ParseFailure):
@@ -80,6 +84,11 @@ class GameService:
                     summary.failed += 1
                     summary.add_error(item.index, f"Invalid game: {exc}", dict(item.game.headers))
                     continue
+                if room is not None and summary.imported >= room:
+                    summary.skipped += 1
+                    summary.add_error(item.index, "Your library is full (game limit reached).", dict(item.game.headers))
+                    continue
+                name_opening(record)
                 game = repo.insert(record)
                 if game is None:
                     summary.duplicates += 1
@@ -94,11 +103,17 @@ class GameService:
             )
         return summary
 
+    def library_room(self, repo: GameRepository) -> int | None:
+        """How many more games this user may store (None = unlimited)."""
+        if self.settings.max_games_per_user is None:
+            return None
+        return max(0, self.settings.max_games_per_user - repo.count())
+
     def list_games(
-        self, filters: GameFilters, *, sort: SortKey, page: int, page_size: int
+        self, user_id: int, filters: GameFilters, *, sort: SortKey, page: int, page_size: int
     ) -> tuple[list[dict[str, Any]], int]:
         with self.db.session() as session:
-            games, total = GameRepository(session).page(
+            games, total = GameRepository(session, user_id).page(
                 filters, sort=sort, offset=(page - 1) * page_size, limit=page_size
             )
             review_status = self._review_status(session, [g.id for g in games])
@@ -155,9 +170,9 @@ class GameService:
             "review": review,
         }
 
-    def detail(self, game_id: int) -> dict[str, Any]:
+    def detail(self, user_id: int, game_id: int) -> dict[str, Any]:
         with self.db.session() as session:
-            game = GameRepository(session).get(game_id)
+            game = GameRepository(session, user_id).get(game_id)
             if game is None:
                 raise NotFoundError("Game not found.")
             review = self._review_status(session, [game_id]).get(game_id)
@@ -169,9 +184,9 @@ class GameService:
             data["headers"] = dict(parsed.headers)
             return data
 
-    def pgn(self, game_id: int) -> tuple[str, str]:
+    def pgn(self, user_id: int, game_id: int) -> tuple[str, str]:
         with self.db.session() as session:
-            game = GameRepository(session).get(game_id)
+            game = GameRepository(session, user_id).get(game_id)
             if game is None:
                 raise NotFoundError("Game not found.")
             return game.pgn, self.filename(game)
@@ -184,36 +199,36 @@ class GameService:
         day = game.played_at.strftime("%Y%m%d") if game.played_at else "undated"
         return f"{safe(game.white)}_vs_{safe(game.black)}_{day}_{game.id}.pgn"
 
-    def export(self, filters: GameFilters, limit: int = 10_000) -> str:
+    def export(self, user_id: int, filters: GameFilters, limit: int = 10_000) -> str:
         with self.db.session() as session:
-            games = GameRepository(session).iterate(filters, sort="played_asc", limit=limit)
+            games = GameRepository(session, user_id).iterate(filters, sort="played_asc", limit=limit)
             return "\n\n".join(g.pgn.strip() for g in games) + ("\n" if games else "")
 
     # Deleting games invalidates the "this archive month is fully imported"
     # validators, otherwise a refresh could skip re-importing deleted games.
     @staticmethod
-    def _forget_validators(session: Any) -> None:
-        session.execute(delete(HttpCacheEntry))
+    def _forget_validators(session: Any, user_id: int) -> None:
+        session.execute(delete(HttpCacheEntry).where(HttpCacheEntry.user_id == user_id))
 
-    def delete(self, game_id: int) -> None:
+    def delete(self, user_id: int, game_id: int) -> None:
         with self.db.session() as session:
-            if not GameRepository(session).delete(game_id):
+            if not GameRepository(session, user_id).delete(game_id):
                 raise NotFoundError("Game not found.")
-            self._forget_validators(session)
+            self._forget_validators(session, user_id)
 
-    def delete_many(self, ids: list[int]) -> int:
+    def delete_many(self, user_id: int, ids: list[int]) -> int:
         with self.db.session() as session:
-            deleted = GameRepository(session).delete_many(ids)
+            deleted = GameRepository(session, user_id).delete_many(ids)
             if deleted:
-                self._forget_validators(session)
+                self._forget_validators(session, user_id)
             return deleted
 
-    def delete_all(self) -> int:
+    def delete_all(self, user_id: int) -> int:
         with self.db.session() as session:
-            deleted = GameRepository(session).delete_all()
-            self._forget_validators(session)
+            deleted = GameRepository(session, user_id).delete_all()
+            self._forget_validators(session, user_id)
             return deleted
 
-    def owners(self) -> list[dict[str, Any]]:
+    def owners(self, user_id: int) -> list[dict[str, Any]]:
         with self.db.session() as session:
-            return [{"source": s, "username": o, "games": c} for s, o, c in GameRepository(session).owners()]
+            return [{"source": s, "username": o, "games": c} for s, o, c in GameRepository(session, user_id).owners()]

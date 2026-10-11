@@ -15,6 +15,7 @@ from app.core.errors import InvalidInputError
 from app.db.session import Database
 from app.models import Game, GameReview, PositionEvaluation
 from app.repositories.games import GameFilters, GameRepository
+from app.services.chess.openings import book
 from app.services.chess.positions import board_from_request
 
 from .compute import ERROR_CLASSES, GameFact, MoveFact, compute_summary
@@ -122,15 +123,14 @@ class StatisticsService:
             )
         return facts
 
-    def summary(self, filters: GameFilters) -> dict[str, Any]:
+    def summary(self, user_id: int, filters: GameFilters) -> dict[str, Any]:
         with self.db.session() as session:
-            games = GameRepository(session).iterate(filters, sort="played_asc")
+            repo = GameRepository(session, user_id)
+            games = repo.iterate(filters, sort="played_asc")
             facts = self._game_facts(games)
             moves = self._move_facts(session, games)
             result = compute_summary(facts, moves)
-            result["owners"] = [
-                {"source": s, "username": o, "games": c} for s, o, c in GameRepository(session).owners()
-            ]
+            result["owners"] = [{"source": s, "username": o, "games": c} for s, o, c in repo.owners()]
             return result
 
 
@@ -173,9 +173,9 @@ class ExplorerService:
                     break
         return index
 
-    def _index(self, filters: GameFilters) -> dict[str, dict[str, dict[str, Any]]]:
+    def _index(self, user_id: int, filters: GameFilters) -> dict[str, dict[str, dict[str, Any]]]:
         with self.db.session() as session:
-            repo = GameRepository(session)
+            repo = GameRepository(session, user_id)
             key = (tuple(sorted((k, str(v)) for k, v in filters.__dict__.items())), repo.version_key())
             with self._lock:
                 if key in self._cache:
@@ -188,11 +188,11 @@ class ExplorerService:
                 self._cache.popitem(last=False)
         return index
 
-    def query(self, fen: str | None, moves: list[str] | None, filters: GameFilters) -> dict[str, Any]:
+    def query(self, user_id: int, fen: str | None, moves: list[str] | None, filters: GameFilters) -> dict[str, Any]:
         board = board_from_request(fen, moves)
         if board.ply() > EXPLORER_MAX_PLY:
             raise InvalidInputError(f"The explorer covers the first {EXPLORER_MAX_PLY // 2} moves of each game.")
-        index = self._index(filters)
+        index = self._index(user_id, filters)
         entries = index.get(board.epd(), {})
         total = sum(e["games"] for e in entries.values())
         result = []
@@ -216,4 +216,11 @@ class ExplorerService:
                 }
             )
         result.sort(key=lambda r: r["games"], reverse=True)
-        return {"fen": board.fen(), "total_games": total, "moves": result, "max_ply": EXPLORER_MAX_PLY}
+        opening = book.classify(fen, list(moves or []))
+        return {
+            "fen": board.fen(),
+            "total_games": total,
+            "moves": result,
+            "max_ply": EXPLORER_MAX_PLY,
+            "opening": {"eco": opening.eco, "name": opening.name} if opening else None,
+        }

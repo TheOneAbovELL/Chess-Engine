@@ -87,7 +87,10 @@ def test_recent_import_newest_first(client: TestClient, respx_mock: respx.Router
     by_id = {g["external_id"]: g for g in games["items"]}
     assert by_id["live/102"]["user_color"] == "black" and by_id["live/102"]["user_result"] == "win"
     assert by_id["live/103"]["time_class"] == "rapid" and by_id["live/103"]["user_result"] == "draw"
-    assert by_id["live/101"]["opening"] == "Ruy Lopez Opening Morphy Defense"
+    # Openings are named from the moves (opening book), not from the source's
+    # headers: this fixture's ECO header claims a Ruy Lopez but 1.d4 d5 2.c4 e6 was played.
+    assert by_id["live/101"]["opening"].startswith("Queen's Gambit Declined")
+    assert by_id["live/101"]["eco"].startswith("D")
     # The request identified itself, as Chess.com asks.
     assert "ChessLab" in respx_mock.calls[0].request.headers["User-Agent"]
 
@@ -270,14 +273,17 @@ def test_interrupted_job_resumes_without_duplicates(client: TestClient, respx_mo
         session.add(
             ImportJob(
                 id="interrupted-1",
+                user_id=1,
                 provider="chesscom",
                 username="alice",
                 params={"provider": "chesscom", "username": USER, "mode": "recent", "max_games": 50},
                 status=RUNNING,
+                worker_id="crashed-worker",  # its process died: no heartbeat
+                heartbeat_at=None,
                 errors=[],
             )
         )
-    container.imports.recover()  # what happens at startup
+    container.imports.requeue()  # any live worker does this on every poll
     container.imports.notify()
     job = wait_for(lambda: (j := client.get("/api/v1/imports/interrupted-1").json())["status"] == "completed" and j)
     assert (job["imported"], job["duplicates"]) == (2, 1)

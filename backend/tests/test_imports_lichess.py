@@ -72,10 +72,10 @@ def test_streamed_import_split_across_chunks(client: TestClient, respx_mock: res
     items = {g["external_id"]: g for g in client.get("/api/v1/games", params={"source": "lichess"}).json()["items"]}
     assert items["AAAAAAAA"]["user_result"] == "win" and items["AAAAAAAA"]["time_class"] == "blitz"
     assert items["BBBBBBBB"]["rated"] is False and items["BBBBBBBB"]["time_class"] == "rapid"
-    assert (
-        items["CCCCCCCC"]["user_result"] == "loss"
-        and items["CCCCCCCC"]["opening"] == "Sicilian Defense: Najdorf Variation"
-    )
+    assert items["CCCCCCCC"]["user_result"] == "loss"
+    # Named from the moves by the opening book (1.e4 c5 2.Nf3 d6 3.d4 cxd4 4.Nxd4 Nf6
+    # is not yet a Najdorf, whatever the fixture's Opening header says).
+    assert items["CCCCCCCC"]["opening"] == "Sicilian Defense: Modern Variations, Main Line"
 
 
 @respx.mock(assert_all_called=False)

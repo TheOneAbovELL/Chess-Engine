@@ -5,11 +5,12 @@ from __future__ import annotations
 from dataclasses import asdict
 from typing import Any
 
-from fastapi import APIRouter, Depends, Path, Query, status
+from fastapi import APIRouter, Depends, Path, Query, Request, status
 
-from app.api.deps import container
+from app.api.deps import container, current_user, rate_key
 from app.core.container import Container
 from app.core.errors import AppError, InvalidInputError, NotFoundError
+from app.services.auth import CurrentUser
 from app.services.providers.base import ChessHistoryProvider, ImportParams, ProviderError, validate_username
 
 from .schemas import ImportJobOut, ProviderUserOut
@@ -68,23 +69,31 @@ def providers(c: Container = Depends(container)) -> list[dict[str, Any]]:
 
 @router.get("/providers/{provider}/users/{username}", response_model=ProviderUserOut, summary="Check a public account")
 async def lookup(
-    provider: str, username: str = Path(max_length=30), c: Container = Depends(container)
+    request: Request,
+    provider: str,
+    username: str = Path(max_length=30),
+    c: Container = Depends(container),
+    user: CurrentUser = Depends(current_user),
 ) -> dict[str, Any]:
+    c.lookup_limiter.check(rate_key(request, user))
     p = _provider(c, provider)
     try:
-        user = await p.lookup_user(_username(username))
+        account = await p.lookup_user(_username(username))
     except ProviderError as exc:
         raise _provider_error(exc) from exc
-    return asdict(user)
+    return asdict(account)
 
 
 @router.get("/providers/{provider}/users/{username}/preview", summary="A few recent public games (not imported)")
 async def preview(
+    request: Request,
     provider: str,
     username: str = Path(max_length=30),
     limit: int = Query(10, ge=1, le=25),
     c: Container = Depends(container),
+    user: CurrentUser = Depends(current_user),
 ) -> list[dict[str, Any]]:
+    c.lookup_limiter.check(rate_key(request, user))
     p = _provider(c, provider)
     try:
         return await p.preview(_username(username), limit)
@@ -95,8 +104,10 @@ async def preview(
 @router.post(
     "/imports", response_model=ImportJobOut, status_code=status.HTTP_202_ACCEPTED, summary="Start an import job"
 )
-def start_import(body: ImportParams, c: Container = Depends(container)) -> dict[str, Any]:
-    return c.imports.create_job(body)
+def start_import(
+    body: ImportParams, c: Container = Depends(container), user: CurrentUser = Depends(current_user)
+) -> dict[str, Any]:
+    return c.imports.create_job(user.id, body)
 
 
 @router.post(
@@ -105,18 +116,19 @@ def start_import(body: ImportParams, c: Container = Depends(container)) -> dict[
     status_code=status.HTTP_202_ACCEPTED,
     summary="Fetch new games for every linked account",
 )
-def refresh_all(c: Container = Depends(container)) -> list[dict[str, Any]]:
+def refresh_all(c: Container = Depends(container), user: CurrentUser = Depends(current_user)) -> list[dict[str, Any]]:
     jobs = []
-    for account in c.store.preferences().accounts:
+    for account in c.store.preferences(user.id).accounts:
         try:
             jobs.append(
                 c.imports.create_job(
+                    user.id,
                     ImportParams(
                         provider=account.provider,
                         username=account.username,
                         mode="refresh",
                         max_games=c.settings.max_import_games,
-                    )
+                    ),
                 )
             )
         except AppError:
@@ -125,20 +137,28 @@ def refresh_all(c: Container = Depends(container)) -> list[dict[str, Any]]:
 
 
 @router.get("/imports", response_model=list[ImportJobOut], summary="Recent import jobs")
-def list_imports(limit: int = Query(20, ge=1, le=100), c: Container = Depends(container)) -> list[dict[str, Any]]:
-    return c.imports.list_jobs(limit)
+def list_imports(
+    limit: int = Query(20, ge=1, le=100), c: Container = Depends(container), user: CurrentUser = Depends(current_user)
+) -> list[dict[str, Any]]:
+    return c.imports.list_jobs(user.id, limit)
 
 
 @router.get("/imports/{job_id}", response_model=ImportJobOut, summary="Import job status")
-def get_import(job_id: str = Path(max_length=36), c: Container = Depends(container)) -> dict[str, Any]:
-    return c.imports.get(job_id)
+def get_import(
+    job_id: str = Path(max_length=36), c: Container = Depends(container), user: CurrentUser = Depends(current_user)
+) -> dict[str, Any]:
+    return c.imports.get(user.id, job_id)
 
 
 @router.post("/imports/{job_id}/cancel", response_model=ImportJobOut)
-def cancel_import(job_id: str = Path(max_length=36), c: Container = Depends(container)) -> dict[str, Any]:
-    return c.imports.cancel(job_id)
+def cancel_import(
+    job_id: str = Path(max_length=36), c: Container = Depends(container), user: CurrentUser = Depends(current_user)
+) -> dict[str, Any]:
+    return c.imports.cancel(user.id, job_id)
 
 
 @router.post("/imports/{job_id}/retry", response_model=ImportJobOut, status_code=status.HTTP_202_ACCEPTED)
-def retry_import(job_id: str = Path(max_length=36), c: Container = Depends(container)) -> dict[str, Any]:
-    return c.imports.retry(job_id)
+def retry_import(
+    job_id: str = Path(max_length=36), c: Container = Depends(container), user: CurrentUser = Depends(current_user)
+) -> dict[str, Any]:
+    return c.imports.retry(user.id, job_id)
