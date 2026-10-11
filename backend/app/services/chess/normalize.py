@@ -122,7 +122,7 @@ def opening_from_eco_url(url: str | None) -> str | None:
     slug = slug.split("...")[0]
     words = []
     for token in slug.split("-"):
-        if re.match(r"^\d+\.", token):  # move numbers start the move suffix
+        if re.match(r"^\d+(\.|$)", token):  # move numbers ("4.Be3" or a bare "2") start the move suffix
             break
         if token:
             words.append(token)

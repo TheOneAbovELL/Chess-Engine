@@ -205,3 +205,33 @@ async def test_stockfish_settings_apply_live(manager: EngineManager) -> None:
     async with manager.slot("stockfish").use(preempt=True) as lease:
         snap = await lease.analyse(chess.Board(), SearchLimits(depth=8))
     assert snap.depth >= 8
+
+
+def test_snapshot_publishes_only_completed_multipv_iterations() -> None:
+    """Line 1 of depth N must never be shown next to line 2 of depth N-1."""
+    import chess.engine
+
+    from app.services.engine.uci import SnapshotBuilder
+
+    board = chess.Board()
+
+    def info(depth: int, multipv: int, uci: str, cp: int) -> chess.engine.InfoDict:
+        return {"depth": depth, "multipv": multipv, "pv": [chess.Move.from_uci(uci)], "score": chess.engine.PovScore(chess.engine.Cp(cp), chess.WHITE)}
+
+    builder = SnapshotBuilder("stockfish", "Stockfish", board, multipv=2)
+    assert not builder.update(info(5, 1, "e2e4", 30))
+    assert builder.snapshot(final=False).depth == 5  # partial data before the first full iteration
+    assert builder.update(info(5, 2, "d2d4", 25))
+    assert builder.update(info(6, 1, "d2d4", 28)) is False  # depth 6 started, only line 1 so far
+    snap = builder.snapshot(final=False)
+    assert snap.depth == 5 and [line.pv[0] for line in snap.lines] == ["e2e4", "d2d4"]
+    assert builder.update(info(6, 2, "e2e4", 26))
+    snap = builder.snapshot(final=True)
+    assert snap.depth == 6 and [line.pv[0] for line in snap.lines] == ["d2d4", "e2e4"]
+    bound = {**info(7, 1, "g1f3", 99), "lowerbound": True}
+    assert builder.update(bound) is False and builder.snapshot(final=False).depth == 6  # fail-high ignored
+
+    single = SnapshotBuilder("x", "x", chess.Board("7k/8/8/8/8/8/8/K6R w - - 0 1"), multipv=5)
+    assert single.expected == 5  # capped by the number of legal moves only when fewer exist
+    only_move = SnapshotBuilder("x", "x", chess.Board("k7/8/1Q6/8/8/8/8/7K b - - 0 1"), multipv=3)
+    assert only_move.expected == 1

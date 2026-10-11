@@ -58,18 +58,28 @@ def to_limit(limits: SearchLimits) -> chess.engine.Limit:
 class SnapshotBuilder:
     """Accumulates UCI ``info`` dictionaries into a normalised snapshot.
 
+    Only *completed* iterations are published: with MultiPV the engine reports
+    lines 1..k for a depth one after another, and mixing line 1 of depth N with
+    line 2 of depth N-1 can show two lines starting with the same move. So
+    lines are collected per depth, and the snapshot shows the deepest depth for
+    which every expected line has arrived (falling back to the best partial
+    data only before the first iteration completes).
+
     Lines flagged ``lowerbound``/``upperbound`` (aspiration-window fail
-    highs/lows) are not complete results, so they only update statistics.
+    highs/lows) are not final results, so they only update statistics.
     """
 
-    def __init__(self, engine_id: str, engine_name: str, board: chess.Board) -> None:
+    def __init__(self, engine_id: str, engine_name: str, board: chess.Board, multipv: int = 1) -> None:
         self.engine_id = engine_id
         self.engine_name = engine_name
         self.board = board
-        self.lines: dict[int, EngineLine] = {}
+        self.expected = max(1, min(multipv, board.legal_moves.count()))
+        self.pending: dict[int, dict[int, EngineLine]] = {}
+        self.completed: list[EngineLine] = []
         self.stats: dict[str, int | None] = {}
 
     def update(self, info: chess.engine.InfoDict) -> bool:
+        """Record an info line. Returns True when a new iteration completed."""
         for key in ("nodes", "nps", "hashfull", "seldepth"):
             if key in info:
                 self.stats[key] = int(info[key])  # type: ignore[literal-required]
@@ -83,28 +93,45 @@ class SnapshotBuilder:
         if not pv:
             return False
         multipv = int(info.get("multipv", 1))
-        self.lines[multipv] = EngineLine(
+        depth = int(info["depth"])
+        line = EngineLine(
             multipv=multipv,
-            depth=int(info["depth"]),
+            depth=depth,
             seldepth=int(info["seldepth"]) if "seldepth" in info else None,
             score=from_pov_score(info["score"]),
             pv=[m.uci() for m in pv],
             pv_san=pv_to_san(self.board, pv),
         )
-        return True
+        bucket = self.pending.setdefault(depth, {})
+        bucket[multipv] = line
+        if len(bucket) >= self.expected and all(k in bucket for k in range(1, self.expected + 1)):
+            self.completed = [bucket[k] for k in range(1, self.expected + 1)]
+            for older in [d for d in self.pending if d <= depth]:
+                del self.pending[older]
+            return True
+        return False
+
+    def _lines(self) -> list[EngineLine]:
+        if self.completed:
+            return self.completed
+        if self.pending:  # nothing complete yet: show the deepest partial iteration
+            bucket = self.pending[max(self.pending)]
+            return [bucket[k] for k in sorted(bucket)]
+        return []
 
     @property
     def depth(self) -> int:
-        return self.lines[1].depth if 1 in self.lines else 0
+        lines = self._lines()
+        return lines[0].depth if lines else 0
 
     def snapshot(self, *, final: bool) -> AnalysisSnapshot:
-        lines = [self.lines[k] for k in sorted(self.lines)]
+        lines = self._lines()
         return AnalysisSnapshot(
             engine_id=self.engine_id,
             engine_name=self.engine_name,
             fen=self.board.fen(),
-            depth=self.depth,
-            seldepth=self.lines[1].seldepth if 1 in self.lines else None,
+            depth=lines[0].depth if lines else 0,
+            seldepth=lines[0].seldepth if lines else None,
             nodes=self.stats.get("nodes"),
             nps=self.stats.get("nps"),
             time_ms=self.stats.get("time_ms"),
@@ -297,7 +324,7 @@ class UciEngine(ChessEngine):
         emit: Any,
         stop: StopSignal,
     ) -> AnalysisSnapshot:
-        builder = SnapshotBuilder(self.engine_id, self._name or self.display_name, board)
+        builder = SnapshotBuilder(self.engine_id, self._name or self.display_name, board, multipv)
         analysis = await protocol.analysis(board, limit, multipv=multipv, info=chess.engine.INFO_ALL)
         loop = asyncio.get_running_loop()
 
@@ -309,7 +336,8 @@ class UciEngine(ChessEngine):
         last_depth = 0
         try:
             async for info in analysis:
-                if builder.update(info) and emit is not None:
+                completed = builder.update(info)
+                if emit is not None and (completed or not builder.completed):
                     now = time.monotonic()
                     if builder.depth != last_depth or now - last_emit >= EMIT_INTERVAL_S:
                         emit(builder.snapshot(final=False))

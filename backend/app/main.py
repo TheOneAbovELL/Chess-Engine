@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import ssl
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
+import certifi
 import httpx
 from fastapi import APIRouter, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -44,11 +46,16 @@ ProviderFactory = Any  # Callable[[Settings], tuple[dict[str, ChessHistoryProvid
 
 
 def default_providers(settings: Settings) -> tuple[dict[str, ChessHistoryProvider], list[httpx.AsyncClient]]:
+    # One verified TLS context for both clients: loading the CA bundle is the
+    # slowest part of creating an HTTPS client.
+    tls = ssl.create_default_context(cafile=certifi.where())
+
     def client() -> httpx.AsyncClient:
         return httpx.AsyncClient(
             headers={"User-Agent": settings.user_agent, "Accept-Encoding": "gzip"},
             timeout=httpx.Timeout(settings.http_timeout_s, connect=10.0),
             follow_redirects=True,
+            verify=tls,
         )
 
     chesscom_client, lichess_client = client(), client()

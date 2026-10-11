@@ -20,7 +20,7 @@ def ev(cp: int | None = None, mate: int | None = None) -> Evaluation:
 
 def test_expected_score_curve() -> None:
     assert expected_score(ev(0), chess.WHITE) == pytest.approx(0.5)
-    assert expected_score(ev(100), chess.WHITE) == pytest.approx(0.5920, abs=1e-3)
+    assert expected_score(ev(100), chess.WHITE) == pytest.approx(0.5910, abs=1e-4)
     assert expected_score(ev(-300), chess.BLACK) == pytest.approx(1 - expected_score(ev(300), chess.WHITE))
     assert expected_score(ev(mate=3), chess.BLACK) == 1.0
     assert expected_score(ev(mate=-2), chess.WHITE) == 0.0
