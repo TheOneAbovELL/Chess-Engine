@@ -1,0 +1,106 @@
+{
+  "engine_version": "0.3.0",
+  "depth": 4,
+  "settings": {},
+  "timestamp": "2026-10-11T13:30:12+00:00",
+  "machine": {
+    "python": "3.13.3",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "processor": "AMD64 Family 25 Model 80 Stepping 0, AuthenticAMD"
+  },
+  "total_nodes": 88551,
+  "total_seconds": 8.297,
+  "nps": 10672,
+  "positions": [
+    {
+      "id": "startpos",
+      "fen": "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+      "best_move": "e2e4",
+      "score": 11,
+      "nodes": 3142,
+      "seconds": 0.555,
+      "nps": 5658
+    },
+    {
+      "id": "kiwipete",
+      "fen": "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+      "best_move": "d5e6",
+      "score": 79,
+      "nodes": 24220,
+      "seconds": 2.593,
+      "nps": 9342
+    },
+    {
+      "id": "cpw-perft-3-endgame",
+      "fen": "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+      "best_move": "b4f4",
+      "score": 87,
+      "nodes": 2403,
+      "seconds": 0.133,
+      "nps": 18133
+    },
+    {
+      "id": "cpw-perft-4",
+      "fen": "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
+      "best_move": "c4c5",
+      "score": -322,
+      "nodes": 7855,
+      "seconds": 0.596,
+      "nps": 13180
+    },
+    {
+      "id": "cpw-perft-5",
+      "fen": "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8",
+      "best_move": "d7c8q",
+      "score": 493,
+      "nodes": 11591,
+      "seconds": 0.852,
+      "nps": 13605
+    },
+    {
+      "id": "cpw-perft-6",
+      "fen": "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10",
+      "best_move": "c3d5",
+      "score": 103,
+      "nodes": 12727,
+      "seconds": 0.913,
+      "nps": 13940
+    },
+    {
+      "id": "qgd-middlegame",
+      "fen": "r1bq1rk1/pp2bppp/2n1pn2/3p4/2PP4/2N1PN2/PP3PPP/R2QKB1R w KQ - 0 8",
+      "best_move": "a1c1",
+      "score": -271,
+      "nodes": 9956,
+      "seconds": 0.734,
+      "nps": 13560
+    },
+    {
+      "id": "sicilian-classical",
+      "fen": "r1bqkb1r/pp2pppp/2np1n2/8/3NP3/2N5/PPP2PPP/R1BQKB1R w KQkq - 2 6",
+      "best_move": "f1b5",
+      "score": 58,
+      "nodes": 14938,
+      "seconds": 1.833,
+      "nps": 8150
+    },
+    {
+      "id": "rook-endgame",
+      "fen": "1K1k4/1P6/8/8/8/8/r7/2R5 w - - 0 1",
+      "best_move": "c1c7",
+      "score": 358,
+      "nodes": 1674,
+      "seconds": 0.088,
+      "nps": 19075
+    },
+    {
+      "id": "back-rank",
+      "fen": "6k1/5ppp/8/8/8/8/5PPP/3R2K1 w - - 0 1",
+      "best_move": "d1d8",
+      "score": 99999,
+      "nodes": 45,
+      "seconds": 0.001,
+      "nps": 48020
+    }
+  ]
+}

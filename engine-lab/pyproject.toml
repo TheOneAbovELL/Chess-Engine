@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chesslab-engine"
+version = "0.3.0"
+description = "Educational UCI chess engine (alpha-beta, quiescence, TT) built on python-chess"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = ["chess==1.11.2"]
+
+[project.scripts]
+chesslab-engine = "chesslab_engine.uci:main"
+
+[tool.setuptools]
+packages = ["chesslab_engine"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

@@ -1,0 +1,55 @@
+# --- Secrets & local configuration -------------------------------------------
+.env
+.env.*
+!.env.example
+
+# --- Local data (imported games, analysis, backups, logs) --------------------
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+backups/
+logs/
+*.log
+
+# --- Engine binaries (download them with scripts/install_stockfish.ps1) ------
+engines/
+!engines/README.md
+
+# --- Python -------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+
+# --- Node / frontend ----------------------------------------------------------
+node_modules/
+frontend/dist/
+frontend/coverage/
+frontend/test-results/
+frontend/playwright-report/
+*.tsbuildinfo
+
+# --- Benchmark outputs (keep the committed baseline only) ---------------------
+engine-lab/benchmarks/results/*
+!engine-lab/benchmarks/results/.gitkeep
+!engine-lab/benchmarks/results/baseline.json
+
+# --- OS / editor --------------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/*
+!.vscode/extensions.json
