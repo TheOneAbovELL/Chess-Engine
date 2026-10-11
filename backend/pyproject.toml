@@ -1,0 +1,73 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chesslab-backend"
+version = "0.1.0"
+description = "ChessLab API: local-first chess analysis, game import and review"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+# Exact pins keep installs reproducible; bump deliberately (see docs/development.md).
+dependencies = [
+    "fastapi==0.143.0",
+    "uvicorn[standard]==0.54.0",
+    "pydantic==2.14.0",
+    "pydantic-settings==2.15.0",
+    "SQLAlchemy==2.1.4",
+    "alembic==1.20.0",
+    "chess==1.11.2",
+    "httpx==0.28.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.1.1",
+    "pytest-asyncio==1.4.0",
+    "respx==0.23.1",
+    "pytest-timeout==2.4.0",
+    "ruff==0.17.0",
+    "mypy==2.4.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+addopts = "-m 'not live'"
+markers = [
+    "live: talks to the real Chess.com / Lichess APIs (opt in with -m live)",
+    "stockfish: needs a real Stockfish executable (skipped automatically if missing)",
+]
+filterwarnings = ["error::pytest.PytestUnraisableExceptionWarning"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+extend-exclude = ["migrations/versions"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "ASYNC", "S"]
+ignore = [
+    "S101",  # assert is fine in tests
+    "S311",  # random is not used for security
+    "RUF012",
+    "B008",  # FastAPI dependency defaults
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S105", "S106", "S108"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+plugins = ["pydantic.mypy"]
+exclude = ["migrations/", "tests/"]
+warn_unused_ignores = false
+
+[[tool.mypy.overrides]]
+module = ["chesslab_engine.*"]
+ignore_missing_imports = true
