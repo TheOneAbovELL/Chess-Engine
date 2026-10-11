@@ -250,8 +250,14 @@ def test_opening_from_eco_url() -> None:
         == "Closed Sicilian Defense Fianchetto Variation"
     )
     assert opening_from_eco_url("https://www.chess.com/openings/Queens-Pawn-Opening-2.Nf3") == "Queens Pawn Opening"
-    assert opening_from_eco_url("https://www.chess.com/openings/Closed-Sicilian-Defense-2...Nc6-3.g3") == "Closed Sicilian Defense"
-    assert opening_from_eco_url("https://www.chess.com/openings/Four-Knights-Game-Glek-Variation-4...Bc5") == "Four Knights Game Glek Variation"
+    assert (
+        opening_from_eco_url("https://www.chess.com/openings/Closed-Sicilian-Defense-2...Nc6-3.g3")
+        == "Closed Sicilian Defense"
+    )
+    assert (
+        opening_from_eco_url("https://www.chess.com/openings/Four-Knights-Game-Glek-Variation-4...Bc5")
+        == "Four Knights Game Glek Variation"
+    )
     assert opening_from_eco_url(None) is None
 
 

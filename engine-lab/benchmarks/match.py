@@ -85,7 +85,9 @@ def parse_options(pairs: list[str]) -> dict[str, str | int | bool]:
     for pair in pairs:
         name, _, value = pair.partition("=")
         low = value.lower()
-        options[name] = True if low == "true" else False if low == "false" else int(value) if value.lstrip("-").isdigit() else value
+        options[name] = (
+            True if low == "true" else False if low == "false" else int(value) if value.lstrip("-").isdigit() else value
+        )
     return options
 
 
@@ -173,15 +175,22 @@ def main() -> None:
                     tally.wins += 1
                 else:
                     tally.losses += 1
-                tally.games.append({"round": str(game_no), "result": result, "engine1": "white" if engine1_white else "black"})
-                print(f"game {game_no:>3}: {result:<7} (engine1 {'white' if engine1_white else 'black'})  running +{tally.wins} ={tally.draws} -{tally.losses}", flush=True)
+                tally.games.append(
+                    {"round": str(game_no), "result": result, "engine1": "white" if engine1_white else "black"}
+                )
+                print(
+                    f"game {game_no:>3}: {result:<7} (engine1 {'white' if engine1_white else 'black'})  running +{tally.wins} ={tally.draws} -{tally.losses}",
+                    flush=True,
+                )
     finally:
         e1.quit()
         e2.quit()
 
     elo, lo, hi = elo_estimate(tally)
     print(f"\nengine1: {name1}\nengine2: {name2}")
-    print(f"Result for engine1: +{tally.wins} ={tally.draws} -{tally.losses}  score {tally.score:.1%} over {tally.n} games ({tally.adjudicated} adjudicated at {args.max_plies} plies)")
+    print(
+        f"Result for engine1: +{tally.wins} ={tally.draws} -{tally.losses}  score {tally.score:.1%} over {tally.n} games ({tally.adjudicated} adjudicated at {args.max_plies} plies)"
+    )
     if elo is not None and lo is not None and hi is not None:
         print(f"Elo difference estimate: {elo:+.0f}  (95% CI {lo:+.0f} .. {hi:+.0f})")
     elif elo is not None and math.isinf(elo):

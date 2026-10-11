@@ -1,0 +1,87 @@
+# Continuous integration. This file only runs if you publish the repository to
+# GitHub yourself; nothing in ChessLab pushes or uploads code automatically.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install Stockfish
+        run: sudo apt-get update && sudo apt-get install -y stockfish
+      - name: Install packages
+        run: pip install -e "backend[dev]" -e engine-lab
+      - name: Lint
+        working-directory: backend
+        run: ruff check app tests && ruff format --check app tests
+      - name: Type check
+        working-directory: backend
+        run: mypy app
+      - name: Tests (mocked HTTP; real custom engine and Stockfish)
+        working-directory: backend
+        env:
+          CHESSLAB_STOCKFISH_PATH: /usr/games/stockfish
+        run: pytest -p no:warnings --timeout 300
+
+  engine:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install -e engine-lab ruff==0.17.0 pytest==9.1.1
+      - working-directory: engine-lab
+        run: ruff check . && pytest -p no:warnings
+      - name: Benchmark signature (depth 3)
+        run: python engine-lab/benchmarks/bench.py --depth 3
+
+  frontend:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci --no-fund --no-audit
+      - run: npx tsc -b
+      - run: npx eslint .
+      - run: npx vitest run
+      - run: npm run build
+
+  e2e:
+    runs-on: ubuntu-24.04
+    needs: [backend, frontend]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: sudo apt-get update && sudo apt-get install -y stockfish
+      - run: python -m venv backend/.venv && backend/.venv/bin/pip install -e "backend[dev]" -e engine-lab
+      - working-directory: frontend
+        run: npm ci --no-fund --no-audit && npm run build
+      - working-directory: frontend
+        env:
+          PLAYWRIGHT_CHANNEL: chrome
+          CHESSLAB_STOCKFISH_PATH: /usr/games/stockfish
+        run: npx playwright test

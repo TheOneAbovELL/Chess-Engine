@@ -216,7 +216,12 @@ def test_snapshot_publishes_only_completed_multipv_iterations() -> None:
     board = chess.Board()
 
     def info(depth: int, multipv: int, uci: str, cp: int) -> chess.engine.InfoDict:
-        return {"depth": depth, "multipv": multipv, "pv": [chess.Move.from_uci(uci)], "score": chess.engine.PovScore(chess.engine.Cp(cp), chess.WHITE)}
+        return {
+            "depth": depth,
+            "multipv": multipv,
+            "pv": [chess.Move.from_uci(uci)],
+            "score": chess.engine.PovScore(chess.engine.Cp(cp), chess.WHITE),
+        }
 
     builder = SnapshotBuilder("stockfish", "Stockfish", board, multipv=2)
     assert not builder.update(info(5, 1, "e2e4", 30))

@@ -29,9 +29,7 @@ Score = tuple[int, int]  # (middlegame, endgame), White's point of view
 
 WHITE, BLACK = chess.WHITE, chess.BLACK
 FILE_MASKS = [chess.BB_FILES[f] for f in range(8)]
-ADJACENT_FILES = [
-    (FILE_MASKS[f - 1] if f > 0 else 0) | (FILE_MASKS[f + 1] if f < 7 else 0) for f in range(8)
-]
+ADJACENT_FILES = [(FILE_MASKS[f - 1] if f > 0 else 0) | (FILE_MASKS[f + 1] if f < 7 else 0) for f in range(8)]
 
 TEMPO_BONUS = 10
 
@@ -122,9 +120,7 @@ def material_pst(board: chess.Board) -> tuple[Score, int]:
 
 def _pawn_attacks(pawns: int, color: chess.Color) -> int:
     if color == WHITE:
-        return ((pawns << 7) & ~chess.BB_FILE_H & chess.BB_ALL) | (
-            (pawns << 9) & ~chess.BB_FILE_A & chess.BB_ALL
-        )
+        return ((pawns << 7) & ~chess.BB_FILE_H & chess.BB_ALL) | ((pawns << 9) & ~chess.BB_FILE_A & chess.BB_ALL)
     return (pawns >> 9) & ~chess.BB_FILE_H | (pawns >> 7) & ~chess.BB_FILE_A
 
 
@@ -279,7 +275,9 @@ def king_safety(board: chess.Board) -> Score:
 
 
 CENTER_DISTANCE = [
-    max(3 - min(chess.square_file(s), 7 - chess.square_file(s)), 3 - min(chess.square_rank(s), 7 - chess.square_rank(s)))
+    max(
+        3 - min(chess.square_file(s), 7 - chess.square_file(s)), 3 - min(chess.square_rank(s), 7 - chess.square_rank(s))
+    )
     for s in chess.SQUARES
 ]
 

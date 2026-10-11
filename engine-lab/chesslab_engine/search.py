@@ -199,10 +199,11 @@ class Searcher:
             completed_depth = depth
             if on_iteration is not None:
                 on_iteration(self._iteration_info(depth, lines))
-            if lines and is_mate_score(lines[0].score) and depth >= MATE - abs(lines[0].score) + 1:
-                # A forced mate found and fully searched: deeper search cannot improve it.
-                if not limits.infinite:
-                    break
+            mate_fully_searched = (
+                bool(lines) and is_mate_score(lines[0].score) and depth >= MATE - abs(lines[0].score) + 1
+            )
+            if mate_fully_searched and not limits.infinite:
+                break  # a forced mate found and fully searched: deeper search cannot improve it
             if soft is not None and time.perf_counter() - self.start_time >= soft:
                 break
             if self.stop_event.is_set():
@@ -250,11 +251,7 @@ class Searcher:
         return chess.polyglot.zobrist_hash(board)
 
     def _is_draw(self, board: chess.Board) -> bool:
-        return (
-            board.halfmove_clock >= 100
-            or board.is_insufficient_material()
-            or board.is_repetition(2)
-        )
+        return board.halfmove_clock >= 100 or board.is_insufficient_material() or board.is_repetition(2)
 
     # ----------------------------------------------------------- move order
     def _order_moves(
@@ -338,9 +335,7 @@ class Searcher:
         return best_score, best_pv
 
     # ----------------------------------------------------------- main search
-    def _negamax(
-        self, board: chess.Board, depth: int, alpha: int, beta: int, ply: int, allow_null: bool
-    ) -> int:
+    def _negamax(self, board: chess.Board, depth: int, alpha: int, beta: int, ply: int, allow_null: bool) -> int:
         self.pv_table[ply] = []
         self.nodes += 1
         if self.nodes % CHECK_EVERY == 0:
@@ -364,7 +359,9 @@ class Searcher:
             depth += 1
 
         if depth <= 0:
-            return self._quiescence(board, alpha, beta, ply) if self.config.quiescence else self.evaluator.evaluate(board)
+            return (
+                self._quiescence(board, alpha, beta, ply) if self.config.quiescence else self.evaluator.evaluate(board)
+            )
 
         pv_node = beta - alpha > 1
         alpha_orig = alpha
@@ -474,7 +471,9 @@ class Searcher:
             promo_rank = chess.BB_RANK_8 if board.turn == chess.WHITE else chess.BB_RANK_1
             moves.extend(
                 m
-                for m in board.generate_legal_moves(board.pawns & board.occupied_co[board.turn], promo_rank & ~board.occupied)
+                for m in board.generate_legal_moves(
+                    board.pawns & board.occupied_co[board.turn], promo_rank & ~board.occupied
+                )
                 if m.promotion == chess.QUEEN
             )
 
@@ -498,9 +497,7 @@ class Searcher:
 
     @staticmethod
     def _has_non_pawn_material(board: chess.Board, color: chess.Color) -> bool:
-        return bool(
-            (board.knights | board.bishops | board.rooks | board.queens) & board.occupied_co[color]
-        )
+        return bool((board.knights | board.bishops | board.rooks | board.queens) & board.occupied_co[color])
 
     @staticmethod
     def _score_to_tt(score: int, ply: int) -> int:

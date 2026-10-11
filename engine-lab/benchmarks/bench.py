@@ -87,13 +87,20 @@ def run(depth: int, positions: list[tuple[str, str]], settings: list[str]) -> di
                 "nps": int(result.nodes / elapsed) if elapsed else 0,
             }
         )
-        print(f"{ident:<22} {rows[-1]['best_move']!s:<7} nodes {result.nodes:>9,}  {elapsed:7.2f}s  {rows[-1]['nps']:>7,} nps", flush=True)
+        print(
+            f"{ident:<22} {rows[-1]['best_move']!s:<7} nodes {result.nodes:>9,}  {elapsed:7.2f}s  {rows[-1]['nps']:>7,} nps",
+            flush=True,
+        )
     return {
         "engine_version": __version__,
         "depth": depth,
         "settings": applied,
         "timestamp": datetime.now(UTC).isoformat(timespec="seconds"),
-        "machine": {"python": platform.python_version(), "platform": platform.platform(), "processor": platform.processor()},
+        "machine": {
+            "python": platform.python_version(),
+            "platform": platform.platform(),
+            "processor": platform.processor(),
+        },
         "total_nodes": total_nodes,
         "total_seconds": round(total_time, 3),
         "nps": int(total_nodes / total_time) if total_time else 0,
@@ -104,7 +111,9 @@ def run(depth: int, positions: list[tuple[str, str]], settings: list[str]) -> di
 def compare(current: dict[str, object], baseline_path: Path) -> None:
     baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
     if baseline.get("depth") != current["depth"]:
-        print(f"\n(baseline depth {baseline.get('depth')} != current depth {current['depth']}: node counts are not comparable)")
+        print(
+            f"\n(baseline depth {baseline.get('depth')} != current depth {current['depth']}: node counts are not comparable)"
+        )
         return
     base_rows = {row["id"]: row for row in baseline["positions"]}
     changed = 0
@@ -116,7 +125,9 @@ def compare(current: dict[str, object], baseline_path: Path) -> None:
         same = base["best_move"] == row["best_move"]
         changed += not same
         delta = (row["nodes"] - base["nodes"]) / base["nodes"] * 100 if base["nodes"] else 0.0
-        print(f"  {row['id']:<22} move {'same' if same else base['best_move'] + ' -> ' + str(row['best_move']):<16} nodes {delta:+6.1f}%")
+        print(
+            f"  {row['id']:<22} move {'same' if same else base['best_move'] + ' -> ' + str(row['best_move']):<16} nodes {delta:+6.1f}%"
+        )
     total_delta = (current["total_nodes"] - baseline["total_nodes"]) / baseline["total_nodes"] * 100  # type: ignore[operator]
     print(f"  total nodes {total_delta:+.1f}%, best-move changes: {changed}/{len(current['positions'])}")  # type: ignore[arg-type]
 
@@ -131,7 +142,9 @@ def main() -> None:
     args = parser.parse_args()
 
     result = run(args.depth, load_positions(args.positions), args.set)
-    print(f"\nTotal: {result['total_nodes']:,} nodes in {result['total_seconds']}s ({result['nps']:,} nps) at depth {args.depth}")
+    print(
+        f"\nTotal: {result['total_nodes']:,} nodes in {result['total_seconds']}s ({result['nps']:,} nps) at depth {args.depth}"
+    )
     if args.compare:
         compare(result, args.compare)
     if args.save:

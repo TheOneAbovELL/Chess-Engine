@@ -1,0 +1,22 @@
+# Local container run:  docker compose up --build   ->  http://127.0.0.1:8000
+# Bound to localhost only. Read docs/deployment.md before exposing it elsewhere
+# (ChessLab has no user accounts; anyone who can reach it can use it).
+services:
+  chesslab:
+    build: .
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - chesslab-data:/data
+    environment:
+      CHESSLAB_CORS_ORIGINS: '["http://127.0.0.1:8000","http://localhost:8000"]'
+      # CHESSLAB_HTTP_CONTACT: you@example.com
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: 2g
+
+volumes:
+  chesslab-data:

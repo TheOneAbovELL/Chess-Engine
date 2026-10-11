@@ -16,7 +16,7 @@ logs/
 *.log
 
 # --- Engine binaries (download them with scripts/install_stockfish.ps1) ------
-engines/
+engines/*
 !engines/README.md
 
 # --- Python -------------------------------------------------------------------

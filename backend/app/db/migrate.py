@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -43,7 +44,9 @@ def sqlite_path(database_url: str) -> Path | None:
 def backup_sqlite(source: Path, destination: Path) -> Path:
     """Consistent online copy using SQLite's backup API (safe while in use)."""
     destination.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(source) as src, sqlite3.connect(destination) as dst:
+    # closing(): a sqlite3 connection used as a context manager only commits;
+    # it must be closed explicitly or the file (and its WAL) stays open.
+    with closing(sqlite3.connect(source)) as src, closing(sqlite3.connect(destination)) as dst:
         src.backup(dst)
     return destination
 
