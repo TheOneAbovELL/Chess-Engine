@@ -1,0 +1,129 @@
+@import "tailwindcss";
+@import "@fontsource-variable/inter";
+@import "@fontsource-variable/jetbrains-mono";
+
+/* ------------------------------------------------------------------ tokens
+   One place for the visual identity: warm graphite surfaces, a restrained
+   brass accent, and semantic colours for evaluations and move quality. */
+@theme {
+  --font-sans: "Inter Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono Variable", ui-monospace, "Cascadia Code", monospace;
+
+  --color-ink-950: #0b0d0f;
+  --color-ink-900: #101215;
+  --color-ink-850: #14171a;
+  --color-ink-800: #181b1f;
+  --color-ink-750: #1d2125;
+  --color-ink-700: #23282d;
+  --color-ink-600: #2e343a;
+  --color-ink-500: #3d444b;
+  --color-ink-400: #5c646c;
+  --color-ink-300: #868e96;
+  --color-ink-200: #aeb4ba;
+  --color-ink-100: #d9dcdf;
+  --color-ink-50: #eef0f1;
+
+  --color-brass-300: #ecc98a;
+  --color-brass-400: #e0b56b;
+  --color-brass-500: #d6a756;
+  --color-brass-600: #b8893c;
+  --color-brass-700: #8c672b;
+
+  --color-sky-line: #7fb2ff;
+  --color-eval-white: #f1eee8;
+  --color-eval-black: #2a2e33;
+
+  --color-q-best: #4fbf8a;
+  --color-q-excellent: #7cc9a0;
+  --color-q-good: #9aa5af;
+  --color-q-inaccuracy: #e6c04f;
+  --color-q-mistake: #ec8f3e;
+  --color-q-blunder: #ef5a52;
+  --color-q-forced: #7d8792;
+
+  --color-win: #4fbf8a;
+  --color-draw: #9aa5af;
+  --color-loss: #ef5a52;
+
+  --radius-card: 14px;
+  --shadow-panel: 0 1px 0 0 rgb(255 255 255 / 0.03) inset, 0 12px 32px -16px rgb(0 0 0 / 0.6);
+}
+
+@layer base {
+  html {
+    color-scheme: dark;
+    background: var(--color-ink-950);
+  }
+  body {
+    @apply bg-ink-950 font-sans text-ink-100 antialiased;
+    font-feature-settings: "cv11", "ss01";
+    min-height: 100dvh;
+  }
+  ::selection {
+    background: rgb(214 167 86 / 0.35);
+  }
+  :focus-visible {
+    outline: 2px solid var(--color-brass-400);
+    outline-offset: 2px;
+    border-radius: 6px;
+  }
+  /* Thin, unobtrusive scrollbars on panels. */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--color-ink-600) transparent;
+  }
+  input,
+  select,
+  textarea,
+  button {
+    font: inherit;
+  }
+}
+
+@layer components {
+  .panel {
+    @apply rounded-[var(--radius-card)] border border-ink-700/80 bg-ink-850;
+    box-shadow: var(--shadow-panel);
+  }
+  .panel-header {
+    @apply flex items-center justify-between gap-3 border-b border-ink-700/70 px-4 py-3;
+  }
+  .label {
+    @apply text-[11px] font-semibold uppercase tracking-[0.08em] text-ink-300;
+  }
+  .num {
+    @apply font-mono tabular-nums;
+  }
+  .field {
+    @apply w-full rounded-lg border border-ink-600 bg-ink-900 px-3 py-2 text-sm text-ink-50 placeholder:text-ink-400 transition-colors focus:border-brass-500 focus:outline-none disabled:opacity-50;
+  }
+  .chip {
+    @apply inline-flex items-center gap-1 rounded-full border border-ink-600 bg-ink-800 px-2.5 py-0.5 text-xs text-ink-200;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+@keyframes shimmer {
+  0% {
+    background-position: -400px 0;
+  }
+  100% {
+    background-position: 400px 0;
+  }
+}
+.skeleton {
+  background: linear-gradient(90deg, var(--color-ink-800) 0%, var(--color-ink-700) 50%, var(--color-ink-800) 100%);
+  background-size: 800px 100%;
+  animation: shimmer 1.4s linear infinite;
+  border-radius: 8px;
+}
